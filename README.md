@@ -69,3 +69,4 @@ require("flyout").setup({
 
 - Flyout runs commands as non-interactive background tasks.
 - TTY-interactive programs are not supported in Flyout mode.
+- On `VimLeavePre`, Flyout sends `SIGTERM` to active tasks, then `SIGKILL` after a short grace period.

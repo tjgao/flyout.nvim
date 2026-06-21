@@ -74,6 +74,21 @@ local function send_signal(task, signal)
         return true
     end
 
+    local kill_cmd = string.format(
+        "kill -%d -- -%d >/dev/null 2>&1 || kill -%d %d >/dev/null 2>&1",
+        signal,
+        task.pid,
+        signal,
+        task.pid
+    )
+    local ok_shell, proc = pcall(vim.system, { "sh", "-c", kill_cmd })
+    if ok_shell and proc then
+        local result = proc:wait(300)
+        if result and result.code == 0 then
+            return true
+        end
+    end
+
     return false, tostring(err or err_pid)
 end
 
@@ -368,6 +383,43 @@ function M.read_output(task_id, read_opts)
         eof = eof,
         path = task.output_path,
     }
+end
+
+function M.shutdown(shutdown_opts)
+    local opts = vim.tbl_deep_extend("force", {
+        grace_ms = 80,
+        force_kill = true,
+    }, shutdown_opts or {})
+
+    local active_ids = {}
+
+    for task_id, task in pairs(tasks) do
+        if is_active(task) then
+            task.stop_requested = true
+            task.status = "stopping"
+            send_signal(task, 15)
+            table.insert(active_ids, task_id)
+        end
+    end
+
+    if #active_ids == 0 then
+        return
+    end
+
+    if opts.grace_ms and opts.grace_ms > 0 then
+        vim.wait(opts.grace_ms)
+    end
+
+    if not opts.force_kill then
+        return
+    end
+
+    for _, task_id in ipairs(active_ids) do
+        local task = tasks[task_id]
+        if task and is_active(task) then
+            send_signal(task, 9)
+        end
+    end
 end
 
 function M.clear_finished(opts)

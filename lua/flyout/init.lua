@@ -44,6 +44,10 @@ function M.clear_finished(opts)
     return task.clear_finished(opts)
 end
 
+function M.shutdown(opts)
+    return task.shutdown(opts)
+end
+
 function M.open_task_list()
     return ui.open_task_list()
 end

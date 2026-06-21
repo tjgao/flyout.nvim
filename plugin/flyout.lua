@@ -76,3 +76,12 @@ vim.api.nvim_create_user_command("FlyoutLog", function(opts)
 end, {
     nargs = 1,
 })
+
+vim.api.nvim_create_autocmd("VimLeavePre", {
+    callback = function()
+        pcall(flyout.shutdown, {
+            grace_ms = 80,
+            force_kill = true,
+        })
+    end,
+})
