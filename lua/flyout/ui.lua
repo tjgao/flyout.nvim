@@ -18,8 +18,17 @@ local list_padding = {
     y = 1,
 }
 
+local ui_defaults = {
+    preview_enabled = true,
+    preview_layout = "side_by_side",
+    task_list_width = nil,
+    preview_width = 44,
+}
+
+local ui_opts = vim.deepcopy(ui_defaults)
+
 local list_min_width = nil
-local preview_min_width = 44
+local preview_width_value = 44
 local preview_gap = 2
 
 local list_state = {
@@ -110,6 +119,24 @@ local function notify_err(err)
     vim.notify("Flyout: " .. err, vim.log.levels.ERROR)
 end
 
+local function resolve_width(value, total_columns, fallback)
+    if type(value) == "number" then
+        return math.max(1, math.floor(value))
+    end
+
+    if type(value) == "string" then
+        local pct = value:match("^(%d+)%%$")
+        if pct then
+            local n = tonumber(pct)
+            if n and n > 0 then
+                return math.max(1, math.floor(total_columns * (n / 100)))
+            end
+        end
+    end
+
+    return fallback
+end
+
 local function task_list_required_width()
     local fields = col_width.task + 1 + col_width.pid + 1 + col_width.state + 1 + command_col_width
     return fields + (list_padding.x * 2)
@@ -138,6 +165,30 @@ local function center_task_list_window()
     local col = math.floor((vim.o.columns - (width + 2)) / 2)
     cfg.col = math.max(0, col)
     vim.api.nvim_win_set_config(list_state.win, cfg)
+end
+
+local function scroll_win_to_bottom(win, buf)
+    if not (win and vim.api.nvim_win_is_valid(win)) then
+        return
+    end
+    if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+        return
+    end
+    if vim.api.nvim_win_get_buf(win) ~= buf then
+        return
+    end
+
+    local last = vim.api.nvim_buf_line_count(buf)
+    if last < 1 then
+        last = 1
+    end
+    local height = vim.api.nvim_win_get_height(win)
+    local topline = math.max(1, last - height + 1)
+
+    vim.api.nvim_win_set_cursor(win, { last, 0 })
+    vim.api.nvim_win_call(win, function()
+        vim.fn.winrestview({ lnum = last, col = 0, topline = topline, leftcol = 0 })
+    end)
 end
 
 local function display_state(item)
@@ -317,11 +368,21 @@ local function ensure_task_list_preview_window()
         return false
     end
 
+    if not ui_opts.preview_enabled then
+        close_task_list_preview()
+        center_task_list_window()
+        return false
+    end
+
     local required_list_width = list_min_width or task_list_required_width()
     local cfg = vim.api.nvim_win_get_config(list_state.win)
     local list_width = tonumber(cfg.width) or 0
     local list_height = tonumber(cfg.height) or 0
     local list_row = tonumber(cfg.row) or 0
+    local preview_layout = ui_opts.preview_layout
+    if preview_layout ~= "top_bottom" then
+        preview_layout = "side_by_side"
+    end
 
     if list_width < required_list_width then
         cfg.width = required_list_width
@@ -329,27 +390,49 @@ local function ensure_task_list_preview_window()
         list_width = required_list_width
     end
 
-    local preview_width = preview_min_width
-    local combined_outer_width = list_width + preview_width + preview_gap + 4
-    if combined_outer_width > vim.o.columns then
-        close_task_list_preview()
-        center_task_list_window()
-        return false
+    local preview_width = preview_width_value
+    local preview_height = math.max(6, math.floor(list_height))
+    local preview_col = 0
+    local preview_row = 0
+
+    if preview_layout == "side_by_side" then
+        local combined_outer_width = list_width + preview_width + preview_gap + 4
+        if combined_outer_width > vim.o.columns then
+            close_task_list_preview()
+            center_task_list_window()
+            return false
+        end
+
+        local start_col = math.max(0, math.floor((vim.o.columns - combined_outer_width) / 2))
+        local list_col = start_col
+        preview_col = list_col + list_width + preview_gap + 2
+        preview_row = math.max(0, math.floor(list_row))
+        cfg.col = list_col
+    else
+        local combined_outer_height = list_height + preview_height + preview_gap + 4
+        if combined_outer_height > vim.o.lines then
+            close_task_list_preview()
+            center_task_list_window()
+            return false
+        end
+
+        local list_col = math.max(0, math.floor((vim.o.columns - (list_width + 2)) / 2))
+        local start_row = math.max(0, math.floor((vim.o.lines - combined_outer_height) / 2 - 1))
+        cfg.col = list_col
+        cfg.row = start_row
+        preview_col = list_col
+        preview_row = start_row + list_height + preview_gap + 2
+        preview_width = list_width
     end
 
-    local start_col = math.max(0, math.floor((vim.o.columns - combined_outer_width) / 2))
-    local list_col = start_col
-    local preview_col = list_col + list_width + preview_gap + 2
-
-    cfg.col = list_col
     vim.api.nvim_win_set_config(list_state.win, cfg)
 
     if list_state.preview_win and vim.api.nvim_win_is_valid(list_state.preview_win) then
         local preview_cfg = vim.api.nvim_win_get_config(list_state.preview_win)
-        preview_cfg.row = math.max(0, math.floor(list_row))
+        preview_cfg.row = math.max(0, math.floor(preview_row))
         preview_cfg.col = math.max(0, math.floor(preview_col))
         preview_cfg.width = preview_width
-        preview_cfg.height = math.max(6, math.floor(list_height))
+        preview_cfg.height = preview_height
         vim.api.nvim_win_set_config(list_state.preview_win, preview_cfg)
         return true
     end
@@ -358,10 +441,10 @@ local function ensure_task_list_preview_window()
     local preview_win = vim.api.nvim_open_win(preview_buf, false, {
         relative = "editor",
         border = "rounded",
-        row = math.max(0, math.floor(list_row)),
+        row = math.max(0, math.floor(preview_row)),
         col = math.max(0, math.floor(preview_col)),
         width = preview_width,
-        height = math.max(6, math.floor(list_height)),
+        height = preview_height,
         title = "Flyout Preview",
         title_pos = "center",
         style = "minimal",
@@ -369,6 +452,7 @@ local function ensure_task_list_preview_window()
 
     list_state.preview_win = preview_win
     list_state.preview_task_id = nil
+    vim.wo[preview_win].scrolloff = 0
     ensure_log_buffer(preview_buf)
     vim.bo[preview_buf].modifiable = true
     vim.api.nvim_buf_set_lines(preview_buf, 0, -1, false, { "Select a task to preview output." })
@@ -423,9 +507,7 @@ update_task_list_preview = function()
         allow_close = false,
     })
     list_state.preview_task_id = task_id
-    if vim.api.nvim_win_is_valid(preview_win) and vim.api.nvim_win_get_buf(preview_win) == preview_buf then
-        vim.api.nvim_win_set_cursor(preview_win, { vim.api.nvim_buf_line_count(preview_buf), 0 })
-    end
+    scroll_win_to_bottom(preview_win, preview_buf)
 end
 
 request_task_list_preview_update = function()
@@ -628,9 +710,13 @@ local function stream_append_lines(view, lines)
         end
     end
 
-    if follow and view.win and vim.api.nvim_win_is_valid(view.win) and vim.api.nvim_win_get_buf(view.win) == view.buf then
-        local new_last_line = vim.api.nvim_buf_line_count(view.buf)
-        vim.api.nvim_win_set_cursor(view.win, { new_last_line, 0 })
+    if
+        follow
+        and view.win
+        and vim.api.nvim_win_is_valid(view.win)
+        and vim.api.nvim_win_get_buf(view.win) == view.buf
+    then
+        scroll_win_to_bottom(view.win, view.buf)
     end
 end
 
@@ -736,6 +822,10 @@ attach_log_view = function(task_id, buf, win, opts)
         win = win,
         header_lines = header_lines,
     }
+
+    if win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
+        vim.wo[win].scrolloff = 0
+    end
 
     vim.bo[buf].modifiable = true
     if header_lines > 0 then
@@ -849,10 +939,9 @@ function M.open_task_log(task_id)
 
     local buf, win = make_float(string.format("Flyout Log #%d", task_id), 110, 28)
     log_float_wins[task_id] = win
+    vim.wo[win].scrolloff = 0
     attach_log_view(task_id, buf, win, { show_header = true })
-    if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
-        vim.api.nvim_win_set_cursor(win, { vim.api.nvim_buf_line_count(buf), 0 })
-    end
+    scroll_win_to_bottom(win, buf)
 end
 
 function M.open_task_log_split(task_id)
@@ -867,9 +956,15 @@ function M.open_task_log_tab(task_id)
     open_log_in_split(task_id, "tab")
 end
 
+function M.setup(opts)
+    ui_opts = vim.tbl_deep_extend("force", {}, ui_defaults, opts or {})
+end
+
 function M.open_task_list()
     local required_list_width = task_list_required_width()
-    list_min_width = required_list_width
+    list_min_width =
+        math.max(required_list_width, resolve_width(ui_opts.task_list_width, vim.o.columns, required_list_width))
+    preview_width_value = math.max(20, resolve_width(ui_opts.preview_width, vim.o.columns, 44))
 
     if list_state.win and vim.api.nvim_win_is_valid(list_state.win) then
         vim.api.nvim_set_current_win(list_state.win)

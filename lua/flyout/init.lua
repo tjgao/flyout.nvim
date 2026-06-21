@@ -4,7 +4,16 @@ local task = require("flyout.task")
 local ui = require("flyout.ui")
 
 function M.setup(opts)
-    task.setup(opts)
+    opts = opts or {}
+
+    local task_opts = opts.task
+    if not task_opts then
+        task_opts = vim.deepcopy(opts)
+        task_opts.ui = nil
+    end
+
+    task.setup(task_opts)
+    ui.setup(opts.ui or {})
 end
 
 function M.start(cmd)

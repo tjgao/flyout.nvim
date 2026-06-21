@@ -226,10 +226,15 @@ function M.stop(task_id, stop_opts)
     end
 
     local timer = uv.new_timer()
+    if not timer then
+        task.status = "failed"
+        return nil, "failed to create stop timer"
+    end
+
     timer:start(opts.stop_timeout_ms, 0, function()
         local current = tasks[task_id]
         if not current or not is_active(current) then
-            if not timer:is_closing() then
+            if timer and not timer:is_closing() then
                 timer:close()
             end
             return
@@ -237,7 +242,7 @@ function M.stop(task_id, stop_opts)
 
         send_signal(current, 9)
 
-        if not timer:is_closing() then
+        if timer and not timer:is_closing() then
             timer:close()
         end
     end)
