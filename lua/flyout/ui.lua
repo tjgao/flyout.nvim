@@ -40,7 +40,8 @@ local list_state = {
     selectable_end = nil,
     preview_win = nil,
     preview_task_id = nil,
-    preview_update_timer = nil,
+    preview_update_pending = false,
+    preview_update_dirty = false,
 }
 
 local log_streams = {}
@@ -353,8 +354,8 @@ local function current_task_id_from_list()
 end
 
 local function close_task_list_preview()
-    stop_timer(list_state.preview_update_timer)
-    list_state.preview_update_timer = nil
+    list_state.preview_update_pending = false
+    list_state.preview_update_dirty = false
     if list_state.preview_win and vim.api.nvim_win_is_valid(list_state.preview_win) then
         vim.api.nvim_win_close(list_state.preview_win, true)
     end
@@ -515,18 +516,32 @@ request_task_list_preview_update = function()
         return
     end
 
-    stop_timer(list_state.preview_update_timer)
-    list_state.preview_update_timer = uv.new_timer()
-    list_state.preview_update_timer:start(60, 0, function()
-        vim.schedule(function()
-            stop_timer(list_state.preview_update_timer)
-            list_state.preview_update_timer = nil
-            if not (list_state.buf and vim.api.nvim_buf_is_valid(list_state.buf)) then
-                return
-            end
-            update_task_list_preview()
-        end)
-    end)
+    list_state.preview_update_dirty = true
+    if list_state.preview_update_pending then
+        return
+    end
+
+    list_state.preview_update_pending = true
+
+    local function process_preview_update()
+        if not (list_state.buf and vim.api.nvim_buf_is_valid(list_state.buf)) then
+            list_state.preview_update_pending = false
+            list_state.preview_update_dirty = false
+            return
+        end
+
+        list_state.preview_update_dirty = false
+        update_task_list_preview()
+
+        if list_state.preview_update_dirty then
+            vim.schedule(process_preview_update)
+            return
+        end
+
+        list_state.preview_update_pending = false
+    end
+
+    vim.schedule(process_preview_update)
 end
 
 local function with_selected_task(action)
