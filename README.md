@@ -42,28 +42,22 @@ require("flyout").setup({
         -- enable/disable preview window in :FlyoutTasks
         preview_enabled = true,
 
-        -- "side_by_side" (default) or "top_bottom"
-        preview_layout = "side_by_side",
-
         -- task list width in columns or percent string
         -- examples: 56, "35%"
-        task_list_width = nil,
-
-        -- preview width in columns or percent string
-        -- only used by side_by_side layout
-        -- examples: 50, "40%"
-        preview_width = 44,
+        -- default is "50%"
+        task_list_width = "50%",
     },
 })
 ```
 
 ### Width Rules
 
-- `task_list_width` and `preview_width` accept either:
+- `task_list_width` accepts either:
   - integer columns (for example `56`)
   - percent string (for example `"35%"`)
 - task-list width is clamped to a minimum required width for fields
-- in `top_bottom` layout, preview width follows task-list width
+- task list and preview are always shown in a top-bottom layout
+- preview width follows task-list width
 
 ## Notes
 

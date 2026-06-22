@@ -8,16 +8,149 @@ local next_id = 1
 local default_opts = {
     stop_timeout_ms = 3000,
     cleanup_output_on_stop = false,
+    force_color = true,
+    force_color_env = {
+        CLICOLOR_FORCE = "1",
+        FORCE_COLOR = "1",
+    },
 }
+
+local instance_id = nil
+local random_seeded = false
+local random_charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+local function flyout_root_dir()
+    return vim.fn.stdpath("cache") .. "/flyout"
+end
+
+local function current_pid()
+    if type(uv.os_getpid) == "function" then
+        return tonumber(uv.os_getpid()) or tonumber(vim.fn.getpid()) or 0
+    end
+    return tonumber(vim.fn.getpid()) or 0
+end
+
+local function process_is_alive(pid)
+    if type(pid) ~= "number" or pid <= 0 then
+        return false
+    end
+    local ok = pcall(uv.kill, pid, 0)
+    return ok
+end
+
+local function ensure_random_seeded()
+    if random_seeded then
+        return
+    end
+
+    local pid = current_pid()
+    local hr = tonumber(uv.hrtime()) or 0
+    local seed = math.floor((hr % 2147483647) + pid)
+    if seed <= 0 then
+        seed = 1
+    end
+
+    math.randomseed(seed)
+    random_seeded = true
+end
+
+local function random_token4()
+    ensure_random_seeded()
+
+    local out = {}
+    local n = #random_charset
+    for i = 1, 4 do
+        local idx = math.random(1, n)
+        out[i] = random_charset:sub(idx, idx)
+    end
+    return table.concat(out)
+end
+
+local function current_instance_id()
+    if instance_id then
+        return instance_id
+    end
+
+    local pid = current_pid()
+    local suffix = random_token4()
+
+    instance_id = string.format("%d-%s", pid, suffix)
+    return instance_id
+end
 
 local function now_ms()
     return uv.now()
 end
 
 local function ensure_output_dir()
-    local dir = vim.fn.stdpath("cache") .. "/flyout"
+    local root = flyout_root_dir()
+    vim.fn.mkdir(root, "p")
+    local dir = root .. "/" .. current_instance_id()
     vim.fn.mkdir(dir, "p")
     return dir
+end
+
+local function startup_cleanup_output_dir()
+    local root = flyout_root_dir()
+    vim.fn.mkdir(root, "p")
+
+    local scanner = uv.fs_scandir(root)
+    if not scanner then
+        return
+    end
+
+    local keep_instance = current_instance_id()
+    while true do
+        local name, file_type = uv.fs_scandir_next(scanner)
+        if not name then
+            break
+        end
+
+        if file_type == "directory" then
+            local child_path = root .. "/" .. name
+            if name ~= keep_instance then
+                local child_pid = tonumber(name:match("^(%d+)%-.+$"))
+                if not child_pid then
+                    vim.fn.delete(child_path, "rf")
+                elseif not process_is_alive(child_pid) then
+                    vim.fn.delete(child_path, "rf")
+                end
+            end
+        elseif file_type == "file" and name:match("%.log$") then
+            vim.fn.delete(root .. "/" .. name)
+        end
+    end
+end
+
+local function cleanup_current_instance_dir()
+    local dir = flyout_root_dir() .. "/" .. current_instance_id()
+    if uv.fs_stat(dir) then
+        vim.fn.delete(dir, "rf")
+    end
+end
+
+local function wallclock_timestamp_ms()
+    local ymd_hms = os.date("%Y%m%d%H%M%S")
+    local ms = 0
+
+    if type(uv.gettimeofday) == "function" then
+        local ok, tv = pcall(uv.gettimeofday)
+        if ok and type(tv) == "table" then
+            if type(tv.usec) == "number" then
+                ms = math.floor(tv.usec / 1000)
+            elseif type(tv.tv_usec) == "number" then
+                ms = math.floor(tv.tv_usec / 1000)
+            end
+        end
+    end
+
+    if ms < 0 then
+        ms = 0
+    elseif ms > 999 then
+        ms = 999
+    end
+
+    return string.format("%s.%03d", ymd_hms, ms)
 end
 
 local function shell_quote_single(value)
@@ -26,8 +159,8 @@ end
 
 local function new_output_path(task_id)
     local dir = ensure_output_dir()
-    local stamp = tostring(os.time())
-    return string.format("%s/task-%d-%s.log", dir, task_id, stamp)
+    local stamp = wallclock_timestamp_ms()
+    return string.format("%s/#%d-%s.log", dir, task_id, stamp)
 end
 
 local function get_task(task_id)
@@ -137,13 +270,40 @@ local function finalize_task(task, obj, opts)
     end
 end
 
-local function build_shell_command(cmd, output_path)
+local function build_env_prefix(opts)
+    if not opts or opts.force_color == false then
+        return ""
+    end
+
+    local env_map = opts.force_color_env or {}
+    local keys = {}
+    for key, _ in pairs(env_map) do
+        if type(key) == "string" and key:match("^[A-Za-z_][A-Za-z0-9_]*$") then
+            table.insert(keys, key)
+        end
+    end
+    table.sort(keys)
+
+    local parts = {}
+    for _, key in ipairs(keys) do
+        table.insert(parts, string.format("%s=%s", key, shell_quote_single(env_map[key])))
+    end
+
+    if #parts == 0 then
+        return ""
+    end
+
+    return table.concat(parts, " ") .. " "
+end
+
+local function build_shell_command(cmd, output_path, opts)
     local path_quoted = shell_quote_single(output_path)
-    return string.format("(%s) > %s 2>&1", cmd, path_quoted)
+    local env_prefix = build_env_prefix(opts)
+    return string.format("(%s%s) > %s 2>&1", env_prefix, cmd, path_quoted)
 end
 
 local function launch_task(task, opts)
-    local shell_cmd = build_shell_command(task.cmd, task.output_path)
+    local shell_cmd = build_shell_command(task.cmd, task.output_path, opts)
     local task_id = task.id
 
     local ok, proc_or_err = pcall(vim.system, { "sh", "-c", shell_cmd }, { detach = true }, function(obj)
@@ -175,6 +335,7 @@ end
 
 function M.setup(opts)
     M.opts = vim.tbl_deep_extend("force", {}, default_opts, opts or {})
+    startup_cleanup_output_dir()
 end
 
 function M.start(cmd)
@@ -402,24 +563,22 @@ function M.shutdown(shutdown_opts)
         end
     end
 
-    if #active_ids == 0 then
-        return
-    end
+    if #active_ids > 0 then
+        if opts.grace_ms and opts.grace_ms > 0 then
+            vim.wait(opts.grace_ms)
+        end
 
-    if opts.grace_ms and opts.grace_ms > 0 then
-        vim.wait(opts.grace_ms)
-    end
-
-    if not opts.force_kill then
-        return
-    end
-
-    for _, task_id in ipairs(active_ids) do
-        local task = tasks[task_id]
-        if task and is_active(task) then
-            send_signal(task, 9)
+        if opts.force_kill then
+            for _, task_id in ipairs(active_ids) do
+                local task = tasks[task_id]
+                if task and is_active(task) then
+                    send_signal(task, 9)
+                end
+            end
         end
     end
+
+    cleanup_current_instance_dir()
 end
 
 function M.clear_finished(opts)
