@@ -8,12 +8,22 @@ local next_id = 1
 local default_opts = {
     stop_timeout_ms = 3000,
     cleanup_output_on_stop = false,
+    timeout_ms = 0,
+    ready_timeout_ms = 0,
     force_color = true,
     force_color_env = {
         CLICOLOR_FORCE = "1",
         FORCE_COLOR = "1",
     },
 }
+
+local listeners = {
+    start = {},
+    ready = {},
+    exit = {},
+    timeout = {},
+}
+local next_listener_id = 1
 
 local instance_id = nil
 local random_seeded = false
@@ -80,6 +90,79 @@ end
 
 local function now_ms()
     return uv.now()
+end
+
+local function normalize_output_line(line)
+    if type(line) ~= "string" then
+        return ""
+    end
+
+    if line:sub(-1) == "\r" then
+        line = line:sub(1, -2)
+    end
+
+    local last_cr = line:match(".*()\r")
+    if last_cr then
+        line = line:sub(last_cr + 1)
+    end
+
+    return (line:gsub("\r", ""))
+end
+
+local function strip_ansi(line)
+    line = normalize_output_line(line)
+    return (line:gsub("\27%[[%d;]*m", ""))
+end
+
+local function read_output_chunk(path, start_line, max_lines)
+    if not uv.fs_stat(path) then
+        return {
+            lines = {},
+            next_line = start_line,
+            eof = true,
+        }
+    end
+
+    local fd = io.open(path, "r")
+    if not fd then
+        return nil, "failed to open output file"
+    end
+
+    local lines = {}
+    local n = 0
+    local line_no = 0
+    local eof = true
+
+    for line in fd:lines() do
+        line_no = line_no + 1
+        if line_no >= start_line then
+            if n >= max_lines then
+                eof = false
+                break
+            end
+            table.insert(lines, line)
+            n = n + 1
+        end
+    end
+
+    fd:close()
+
+    return {
+        lines = lines,
+        next_line = start_line + n,
+        eof = eof,
+    }
+end
+
+local function emit_event(event, payload)
+    local handlers = listeners[event]
+    if not handlers then
+        return
+    end
+
+    for _, callback in pairs(handlers) do
+        pcall(callback, payload)
+    end
 end
 
 local function ensure_output_dir()
@@ -175,6 +258,92 @@ local function is_active(task)
     return task.status == "running" or task.status == "stopping"
 end
 
+local function normalize_ready_when(ready_when, fallback_timeout_ms)
+    if ready_when == nil then
+        return nil
+    end
+
+    if type(ready_when) == "string" then
+        if ready_when == "" then
+            return nil, "ready_when pattern must be non-empty"
+        end
+        return {
+            pattern = ready_when,
+            match = "plain",
+            count = 1,
+            timeout_ms = tonumber(fallback_timeout_ms) or 0,
+        }
+    end
+
+    if type(ready_when) ~= "table" then
+        return nil, "ready_when must be a string or table"
+    end
+
+    local pattern = ready_when.pattern
+    if type(pattern) ~= "string" or pattern == "" then
+        return nil, "ready_when.pattern must be a non-empty string"
+    end
+
+    local match = ready_when.match
+    if match == nil then
+        match = "plain"
+    end
+    if match ~= "plain" and match ~= "regex" then
+        return nil, "ready_when.match must be 'plain' or 'regex'"
+    end
+
+    if match == "regex" then
+        local ok, err = pcall(function()
+            local _ = string.find("", pattern)
+        end)
+        if not ok then
+            return nil, "invalid ready_when regex: " .. tostring(err)
+        end
+    end
+
+    local count = tonumber(ready_when.count) or 1
+    count = math.floor(count)
+    if count < 1 then
+        return nil, "ready_when.count must be >= 1"
+    end
+
+    local timeout_ms = ready_when.timeout_ms
+    if timeout_ms == nil then
+        timeout_ms = fallback_timeout_ms
+    end
+    timeout_ms = tonumber(timeout_ms) or 0
+    timeout_ms = math.max(0, math.floor(timeout_ms))
+
+    return {
+        pattern = pattern,
+        match = match,
+        count = count,
+        timeout_ms = timeout_ms,
+    }
+end
+
+local function resolve_run_opts(global_opts, start_opts)
+    start_opts = start_opts or {}
+
+    local timeout_ms = start_opts.timeout_ms
+    if timeout_ms == nil then
+        timeout_ms = global_opts.timeout_ms
+    end
+    timeout_ms = tonumber(timeout_ms) or 0
+    timeout_ms = math.max(0, math.floor(timeout_ms))
+
+    local ready_when, ready_err = normalize_ready_when(start_opts.ready_when, global_opts.ready_timeout_ms)
+    if ready_err then
+        return nil, ready_err
+    end
+
+    return {
+        timeout_ms = timeout_ms,
+        ready_when = ready_when,
+        notify = start_opts.notify,
+    }
+end
+
 local function public_task(task)
     return {
         id = task.id,
@@ -189,6 +358,9 @@ local function public_task(task)
         pid = task.pid,
         exit_code = task.exit_code,
         signal = task.signal,
+        ready = task.ready,
+        ready_at = task.ready_at,
+        notify = task.notify,
     }
 end
 
@@ -230,7 +402,17 @@ local function cleanup_task_runtime(task)
         task.stop_timer:stop()
         task.stop_timer:close()
     end
+    if task.timeout_timer and not task.timeout_timer:is_closing() then
+        task.timeout_timer:stop()
+        task.timeout_timer:close()
+    end
+    if task.ready_timer and not task.ready_timer:is_closing() then
+        task.ready_timer:stop()
+        task.ready_timer:close()
+    end
     task.stop_timer = nil
+    task.timeout_timer = nil
+    task.ready_timer = nil
     task.proc = nil
     task.pid = nil
 end
@@ -252,7 +434,9 @@ local function finalize_task(task, obj, opts)
     task.ended_at = now_ms()
 
     if task.stop_requested then
-        if obj.signal == 15 then
+        if task.timeout_reached then
+            task.status = "timeout"
+        elseif obj.signal == 15 then
             task.status = "stopped"
         elseif obj.signal == 9 then
             task.status = "killed"
@@ -260,6 +444,9 @@ local function finalize_task(task, obj, opts)
             task.status = "stopped"
         end
         maybe_delete_output(task, opts)
+        emit_event("exit", {
+            task = public_task(task),
+        })
         return
     end
 
@@ -268,6 +455,10 @@ local function finalize_task(task, obj, opts)
     else
         task.status = "failed"
     end
+
+    emit_event("exit", {
+        task = public_task(task),
+    })
 end
 
 local function build_env_prefix(opts)
@@ -302,6 +493,126 @@ local function build_shell_command(cmd, output_path, opts)
     return string.format("(%s%s) > %s 2>&1", env_prefix, cmd, path_quoted)
 end
 
+local function line_matches_ready(ready_when, line)
+    if ready_when.match == "regex" then
+        return line:find(ready_when.pattern) ~= nil
+    end
+    return line:find(ready_when.pattern, 1, true) ~= nil
+end
+
+local function start_ready_watcher(task)
+    if not task.ready_when then
+        return
+    end
+
+    local timer = uv.new_timer()
+    if not timer then
+        return
+    end
+
+    task.ready_timer = timer
+    local check_interval = 300
+    timer:start(0, check_interval, function()
+        vim.schedule(function()
+            local current = tasks[task.id]
+            if not current or not is_active(current) then
+                if timer and not timer:is_closing() then
+                    timer:stop()
+                    timer:close()
+                end
+                return
+            end
+
+            if current.ready then
+                if timer and not timer:is_closing() then
+                    timer:stop()
+                    timer:close()
+                end
+                current.ready_timer = nil
+                return
+            end
+
+            local timeout_ms = current.ready_when.timeout_ms or 0
+            if timeout_ms > 0 and current.started_at and (now_ms() - current.started_at) >= timeout_ms then
+                if timer and not timer:is_closing() then
+                    timer:stop()
+                    timer:close()
+                end
+                current.ready_timer = nil
+                emit_event("timeout", {
+                    kind = "ready",
+                    task = public_task(current),
+                })
+                return
+            end
+
+            local chunk, chunk_err = read_output_chunk(current.output_path, current.ready_next_line or 1, 300)
+            if not chunk then
+                vim.notify("Flyout: " .. tostring(chunk_err), vim.log.levels.ERROR)
+                return
+            end
+
+            current.ready_next_line = chunk.next_line
+
+            for _, raw_line in ipairs(chunk.lines) do
+                local plain = strip_ansi(raw_line)
+                if line_matches_ready(current.ready_when, plain) then
+                    current.ready_match_count = current.ready_match_count + 1
+                    if current.ready_match_count >= current.ready_when.count then
+                        current.ready = true
+                        current.ready_at = now_ms()
+                        if timer and not timer:is_closing() then
+                            timer:stop()
+                            timer:close()
+                        end
+                        current.ready_timer = nil
+                        emit_event("ready", {
+                            task = public_task(current),
+                            count = current.ready_match_count,
+                            line = plain,
+                        })
+                        return
+                    end
+                end
+            end
+        end)
+    end)
+end
+
+local function start_task_timeout(task, opts)
+    local timeout_ms = (task.run_opts and task.run_opts.timeout_ms) or 0
+    if timeout_ms <= 0 then
+        return
+    end
+
+    local timer = uv.new_timer()
+    if not timer then
+        return
+    end
+
+    task.timeout_timer = timer
+    timer:start(timeout_ms, 0, function()
+        vim.schedule(function()
+            local current = tasks[task.id]
+            if not current or not is_active(current) then
+                if timer and not timer:is_closing() then
+                    timer:close()
+                end
+                return
+            end
+
+            current.timeout_reached = true
+            emit_event("timeout", {
+                kind = "task",
+                task = public_task(current),
+            })
+            M.stop(current.id, {
+                stop_timeout_ms = opts.stop_timeout_ms,
+            })
+        end)
+    end)
+end
+
 local function launch_task(task, opts)
     local shell_cmd = build_shell_command(task.cmd, task.output_path, opts)
     local task_id = task.id
@@ -324,11 +635,21 @@ local function launch_task(task, opts)
     task.started_at = now_ms()
     task.ended_at = nil
     task.stop_requested = false
+    task.timeout_reached = false
     task.stop_timer = nil
+    task.timeout_timer = nil
+    task.ready_timer = nil
     task.exit_code = nil
     task.signal = nil
     task.proc = proc_or_err
     task.pid = proc_or_err.pid
+    task.ready = false
+    task.ready_at = nil
+    task.ready_match_count = 0
+    task.ready_next_line = 1
+
+    start_task_timeout(task, opts)
+    start_ready_watcher(task)
 
     return task
 end
@@ -338,12 +659,17 @@ function M.setup(opts)
     startup_cleanup_output_dir()
 end
 
-function M.start(cmd)
+function M.start(cmd, start_opts)
     if type(cmd) ~= "string" or vim.trim(cmd) == "" then
         return nil, "command must be a non-empty string"
     end
 
     local opts = M.opts or default_opts
+    local run_opts, run_opts_err = resolve_run_opts(opts, start_opts)
+    if not run_opts then
+        return nil, run_opts_err
+    end
+
     local task_id = next_id
     next_id = next_id + 1
 
@@ -364,6 +690,14 @@ function M.start(cmd)
         pid = nil,
         exit_code = nil,
         signal = nil,
+        run_opts = run_opts,
+        ready_when = run_opts.ready_when,
+        notify = run_opts.notify,
+        ready = false,
+        ready_at = nil,
+        ready_match_count = 0,
+        ready_next_line = 1,
+        timeout_reached = false,
     }
 
     local started, start_err = launch_task(task, opts)
@@ -372,6 +706,10 @@ function M.start(cmd)
     end
 
     tasks[task_id] = task
+
+    emit_event("start", {
+        task = public_task(task),
+    })
 
     return public_task(task)
 end
@@ -461,10 +799,21 @@ function M.rerun(task_id)
     task.cmd = cmd
 
     local opts = M.opts or default_opts
+    local run_opts = task.run_opts or {
+        timeout_ms = opts.timeout_ms,
+        ready_when = nil,
+    }
+    task.run_opts = run_opts
+    task.ready_when = run_opts.ready_when
+    task.notify = run_opts.notify
     local restarted, restart_err = launch_task(task, opts)
     if not restarted then
         return nil, restart_err
     end
+
+    emit_event("start", {
+        task = public_task(task),
+    })
 
     return public_task(task)
 end
@@ -589,6 +938,28 @@ function M.clear_finished(opts)
             tasks[task_id] = nil
         end
     end
+end
+
+function M.on(event, callback)
+    if type(event) ~= "string" or not listeners[event] then
+        return nil, "unknown event: " .. tostring(event)
+    end
+    if type(callback) ~= "function" then
+        return nil, "callback must be a function"
+    end
+
+    local id = next_listener_id
+    next_listener_id = next_listener_id + 1
+    listeners[event][id] = callback
+    return id
+end
+
+function M.off(event, listener_id)
+    if type(event) ~= "string" or not listeners[event] then
+        return false
+    end
+    listeners[event][listener_id] = nil
+    return true
 end
 
 M.opts = vim.deepcopy(default_opts)

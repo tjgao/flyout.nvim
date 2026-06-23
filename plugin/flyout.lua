@@ -29,13 +29,11 @@ local function complete_quickfix(arglead, cmdline)
 end
 
 vim.api.nvim_create_user_command("Flyout", function(opts)
-    local task, err = flyout.start(opts.args)
-    if not task then
+    local _, err = flyout.start(opts.args)
+    if err then
         vim.notify("Flyout: " .. err, vim.log.levels.ERROR)
         return
     end
-
-    vim.notify(string.format("Flyout: started task #%d", task.id))
 end, {
     nargs = "+",
     complete = "shellcmd",
@@ -53,8 +51,6 @@ vim.api.nvim_create_user_command("FlyoutStop", function(opts)
         vim.notify("Flyout: " .. err, vim.log.levels.ERROR)
         return
     end
-
-    vim.notify(string.format("Flyout: stopping task #%d", task.id))
 end, {
     nargs = 1,
 })
@@ -66,13 +62,11 @@ vim.api.nvim_create_user_command("FlyoutRerun", function(opts)
         return
     end
 
-    local task, err = flyout.rerun(task_id)
-    if not task then
+    local _, err = flyout.rerun(task_id)
+    if err then
         vim.notify("Flyout: " .. err, vim.log.levels.ERROR)
         return
     end
-
-    vim.notify(string.format("Flyout: started task #%d", task.id))
 end, {
     nargs = 1,
 })
@@ -106,13 +100,11 @@ vim.api.nvim_create_user_command("FlyoutQuickfix", function(opts)
         return
     end
 
-    local task, err = flyout.run_quickfix(parser, cmd)
-    if not task then
+    local _, err = flyout.run_quickfix(parser, cmd)
+    if err then
         vim.notify("Flyout: " .. err, vim.log.levels.ERROR)
         return
     end
-
-    vim.notify(string.format("Flyout: started task #%d", task.id))
 end, {
     nargs = "+",
     complete = complete_quickfix,

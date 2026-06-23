@@ -39,6 +39,8 @@ require("flyout").setup({
     task = {
         stop_timeout_ms = 3000,
         cleanup_output_on_stop = false,
+        timeout_ms = 0,
+        ready_timeout_ms = 0,
     },
     ui = {
         -- enable/disable preview window in :FlyoutTasks
@@ -65,6 +67,15 @@ require("flyout").setup({
             -- gcc = { efm = "%f:%l:%c: %m" },
         },
     },
+    notifications = {
+        start = true,
+        ["end"] = true,
+        progress = {
+            enabled = false,
+            interval_ms = 120,
+            frames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" },
+        },
+    },
 })
 ```
 
@@ -74,6 +85,20 @@ require("flyout").setup({
 - Generated commands use parser names with your prefix:
   `:Fgcc`, `:Fmsvc`, `:Frust`, `:Fgo`, `:Fpy`, `:Fpyt`, `:Ftsc`, `:Fjs`, `:Fjava`, `:Flua`
 - You can extend or override parser definitions with `quickfix.parsers`
+
+### Notifications
+
+- Notification toggles are independent: `start`, `progress.enabled`, `end`
+- To show progress only, set: `start = false`, `progress.enabled = true`, `end = false`
+- Progress stops automatically on task `ready` (if `ready_when` is set) or task exit
+- Progress spinner uses `vim.notify` and reuses your active notifier UI style
+
+### API Run Options
+
+- `require("flyout").start(cmd, opts)` supports:
+  - `timeout_ms`
+  - `ready_when = "plain text"` or `{ pattern, match = "plain"|"regex", count, timeout_ms }`
+  - `notify = { start, ["end"], progress = true|{ enabled, interval_ms, frames } }`
 
 ### Width Rules
 

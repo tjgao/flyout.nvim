@@ -34,7 +34,7 @@ local ui_opts = vim.deepcopy(ui_defaults)
 local list_min_width = nil
 local preview_gap = 0
 local task_list_footer =
-    "[Enter] float log  [S] split  [V] vsplit  [T] tab  [x] quickfix  [s] stop  [r] rerun  [c] clear  [R] refresh  [q] close"
+"[Enter] float log  [S] split  [V] vsplit  [T] tab  [x] quickfix  [s] stop  [r] rerun  [c] clear  [R] refresh  [q] close"
 
 local list_state = {
     buf = nil,
@@ -80,7 +80,8 @@ local ansi_hl_by_code = {
 
 local quickfix_presets = {
     gcc = {
-        efm = "%E%f:%l:%c: error: %m,%E%f:%l: error: %m,%W%f:%l:%c: warning: %m,%W%f:%l: warning: %m,%I%f:%l:%c: note: %m,%I%f:%l: note: %m,%E%f:%l:%c: fatal error: %m,%E%f:%l: fatal error: %m,%-G%.%#",
+        efm =
+        "%E%f:%l:%c: error: %m,%E%f:%l: error: %m,%W%f:%l:%c: warning: %m,%W%f:%l: warning: %m,%I%f:%l:%c: note: %m,%I%f:%l: note: %m,%E%f:%l:%c: fatal error: %m,%E%f:%l: fatal error: %m,%-G%.%#",
     },
     msvc = {
         efm = "%f(%l,%c): %t%*[^:]: %m,%f(%l): %t%*[^:]: %m,%-G%.%#",
@@ -428,6 +429,10 @@ local function display_state(item)
         return "STOPPED", "Comment"
     end
 
+    if item.status == "timeout" then
+        return "TIMEOUT", "DiagnosticError"
+    end
+
     if item.status == "success" and item.exit_code == 0 then
         return "DONE", "DiagnosticOk"
     end
@@ -702,8 +707,7 @@ local function ensure_task_list_preview_window()
         preview_cfg.width = preview_width
         preview_cfg.height = preview_height
         preview_cfg.focusable = false
-        preview_cfg.footer =
-        task_list_footer
+        preview_cfg.footer = task_list_footer
         preview_cfg.footer_pos = "center"
         vim.api.nvim_win_set_config(list_state.preview_win, preview_cfg)
         vim.wo[list_state.preview_win].number = false
@@ -763,7 +767,13 @@ update_task_list_preview = function()
             local preview_buf = vim.api.nvim_create_buf(false, true)
             ensure_log_buffer(preview_buf)
             vim.bo[preview_buf].modifiable = true
-            vim.api.nvim_buf_set_lines(preview_buf, 0, -1, false, with_preview_padding({ "Select a task to preview output." }))
+            vim.api.nvim_buf_set_lines(
+                preview_buf,
+                0,
+                -1,
+                false,
+                with_preview_padding({ "Select a task to preview output." })
+            )
             vim.bo[preview_buf].modifiable = false
             vim.api.nvim_win_set_buf(preview_win, preview_buf)
         end
@@ -1304,7 +1314,13 @@ attach_log_view = function(task_id, buf, win, opts)
         end
 
         if preserve_existing_body then
-            vim.api.nvim_buf_set_lines(buf, 0, view.top_padding_lines + header_lines, false, vim.list_extend(top_padding, header))
+            vim.api.nvim_buf_set_lines(
+                buf,
+                0,
+                view.top_padding_lines + header_lines,
+                false,
+                vim.list_extend(top_padding, header)
+            )
         else
             local initial = vim.list_extend(top_padding, header)
             for _ = 1, view.bottom_padding_lines do
@@ -1377,7 +1393,6 @@ attach_log_view = function(task_id, buf, win, opts)
                 notify_err(stop_err)
                 return
             end
-            vim.notify(string.format("Flyout: stopping task #%d", task_id))
         end, { buffer = buf, silent = true })
         vim.keymap.set("n", "r", function()
             local restarted, restart_err = task.rerun(task_id)
@@ -1385,7 +1400,6 @@ attach_log_view = function(task_id, buf, win, opts)
                 notify_err(restart_err)
                 return
             end
-            vim.notify(string.format("Flyout: started task #%d", restarted.id))
             notify_task_restarted(task_id, restarted.started_at)
         end, { buffer = buf, silent = true })
     end
@@ -1573,7 +1587,6 @@ function M.open_task_quickfix(task_id, opts)
     local qf = vim.fn.getqflist({ size = 1 })
     local size = tonumber(qf.size) or 0
     if size < 1 then
-        vim.notify(string.format("Flyout: no quickfix entries parsed for task #%d", task_id), vim.log.levels.WARN)
         return
     end
 
@@ -1671,7 +1684,6 @@ function M.open_task_list()
                 notify_err(err)
                 return
             end
-            vim.notify(string.format("Flyout: stopping task #%d", task_id))
         end)
     end, { buffer = buf, silent = true })
     vim.keymap.set("n", "r", function()
@@ -1681,7 +1693,6 @@ function M.open_task_list()
                 notify_err(err)
                 return
             end
-            vim.notify(string.format("Flyout: started task #%d", started.id))
             notify_task_restarted(task_id, started.started_at)
         end)
     end, { buffer = buf, silent = true })
