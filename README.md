@@ -50,6 +50,17 @@ require("flyout").setup({
         -- examples: 56, "35%"
         -- default is "50%"
         task_list_width = "50%",
+
+        -- task list height in rows or percent string
+        -- examples: 18, "40%"
+        -- default is 18
+        task_list_height = 18,
+
+        -- preview height in rows, percent string, or "match"
+        -- "match" means same height as task list
+        -- examples: "match", 14, "35%"
+        -- default is "match"
+        preview_height = "match",
     },
     quickfix = {
         -- auto-generate parser commands like :Fgcc, :Fmsvc, :Frust
@@ -108,6 +119,17 @@ require("flyout").setup({
 - task-list width is clamped to a minimum required width for fields
 - task list and preview are always shown in a top-bottom layout
 - preview width follows task-list width
+
+### Height Rules
+
+- `task_list_height` accepts:
+  - integer rows (for example `18`)
+  - percent string (for example `"40%"`)
+- `preview_height` accepts:
+  - `"match"` (same as task-list height)
+  - integer rows (for example `14`)
+  - percent string (for example `"35%"`)
+- if list + preview cannot fit in the current screen, preview is hidden automatically
 
 ## Notes
 

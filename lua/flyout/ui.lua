@@ -16,7 +16,7 @@ local min_command_col_width = 8
 
 local list_padding = {
     x = 2,
-    y = 1,
+    y = 0,
 }
 
 local preview_padding = {
@@ -27,6 +27,8 @@ local preview_padding = {
 local ui_defaults = {
     preview_enabled = true,
     task_list_width = "50%",
+    task_list_height = 18,
+    preview_height = "match",
 }
 
 local ui_opts = vim.deepcopy(ui_defaults)
@@ -187,13 +189,13 @@ local function make_float(title, width, height, footer)
     return buf, win
 end
 
-local function resolve_task_list_open_position(width, height)
+local function resolve_task_list_open_position(width, height, preview_height)
     local list_col = math.max(0, math.floor((vim.o.columns - (width + 2)) / 2))
     local list_row = math.floor((vim.o.lines - height) / 2 - 1)
 
     if ui_opts.preview_enabled then
-        local preview_height = math.max(6, math.floor(height))
-        local combined_outer_height = height + preview_height + preview_gap + 4
+        local pheight = math.max(6, math.floor(preview_height or height))
+        local combined_outer_height = height + pheight + preview_gap + 4
         if combined_outer_height <= vim.o.lines then
             list_row = math.floor((vim.o.lines - combined_outer_height) / 2 - 1)
         end
@@ -232,6 +234,26 @@ local function resolve_width(value, total_columns, fallback)
     end
 
     return fallback
+end
+
+local function resolve_task_list_height()
+    local fallback = 18
+    local min_height = 8
+    local height = resolve_width(ui_opts.task_list_height, vim.o.lines, fallback)
+    height = math.max(min_height, math.floor(height))
+    height = math.min(height, math.max(min_height, vim.o.lines - 4))
+    return height
+end
+
+local function resolve_preview_height(list_height)
+    if ui_opts.preview_height == "match" or ui_opts.preview_height == nil then
+        return math.max(6, math.floor(list_height))
+    end
+
+    local height = resolve_width(ui_opts.preview_height, vim.o.lines, list_height)
+    height = math.max(6, math.floor(height))
+    height = math.min(height, math.max(6, vim.o.lines - 4))
+    return height
 end
 
 local function task_list_required_width()
@@ -680,7 +702,7 @@ local function ensure_task_list_preview_window()
     end
 
     local preview_width = list_width
-    local preview_height = math.max(6, math.floor(list_height))
+    local preview_height = resolve_preview_height(list_height)
     local preview_col = 0
     local preview_row = 0
 
@@ -1634,6 +1656,8 @@ end
 
 function M.open_task_list()
     local required_list_width = task_list_required_width()
+    local list_height = resolve_task_list_height()
+    local preview_height = resolve_preview_height(list_height)
     list_min_width =
         math.max(required_list_width, resolve_width(ui_opts.task_list_width, vim.o.columns, required_list_width))
 
@@ -1643,15 +1667,15 @@ function M.open_task_list()
         return
     end
 
-    local buf, win = make_float("Flyout Tasks", list_min_width, 18)
-    local list_open_pos = resolve_task_list_open_position(list_min_width, 18)
+    local buf, win = make_float("Flyout Tasks", list_min_width, list_height)
+    local list_open_pos = resolve_task_list_open_position(list_min_width, list_height, preview_height)
     vim.api.nvim_win_set_config(win, {
         relative = "editor",
         border = "rounded",
         row = list_open_pos.row,
         col = list_open_pos.col,
         width = list_min_width,
-        height = 18,
+        height = list_height,
         title = "Flyout Tasks",
         title_pos = "center",
         style = "minimal",
