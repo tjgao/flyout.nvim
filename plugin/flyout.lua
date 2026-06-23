@@ -11,6 +11,23 @@ local function parse_task_id(value)
     return id
 end
 
+local function complete_quickfix(arglead, cmdline)
+    local parts = vim.split(cmdline, "%s+", { trimempty = true })
+    local ends_with_space = cmdline:match("%s$") ~= nil
+
+    if #parts <= 1 or (#parts == 2 and not ends_with_space) then
+        local out = {}
+        for _, parser in ipairs(flyout.quickfix_parsers()) do
+            if arglead == "" or parser:sub(1, #arglead) == arglead then
+                table.insert(out, parser)
+            end
+        end
+        return out
+    end
+
+    return vim.fn.getcompletion(arglead, "shellcmd")
+end
+
 vim.api.nvim_create_user_command("Flyout", function(opts)
     local task, err = flyout.start(opts.args)
     if not task then
@@ -75,6 +92,30 @@ vim.api.nvim_create_user_command("FlyoutLog", function(opts)
     flyout.open_task_log(task_id)
 end, {
     nargs = 1,
+})
+
+vim.api.nvim_create_user_command("FlyoutQuickfix", function(opts)
+    local parser = opts.fargs[1]
+    local cmd = table.concat(vim.list_slice(opts.fargs, 2), " ")
+    if not parser or parser == "" then
+        vim.notify("Flyout: parser is required", vim.log.levels.ERROR)
+        return
+    end
+    if vim.trim(cmd) == "" then
+        vim.notify("Flyout: command is required", vim.log.levels.ERROR)
+        return
+    end
+
+    local task, err = flyout.run_quickfix(parser, cmd)
+    if not task then
+        vim.notify("Flyout: " .. err, vim.log.levels.ERROR)
+        return
+    end
+
+    vim.notify(string.format("Flyout: started task #%d", task.id))
+end, {
+    nargs = "+",
+    complete = complete_quickfix,
 })
 
 vim.api.nvim_create_autocmd("VimLeavePre", {

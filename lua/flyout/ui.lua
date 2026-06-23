@@ -33,6 +33,8 @@ local ui_opts = vim.deepcopy(ui_defaults)
 
 local list_min_width = nil
 local preview_gap = 0
+local task_list_footer =
+    "[Enter] float log  [S] split  [V] vsplit  [T] tab  [x] quickfix  [s] stop  [r] rerun  [c] clear  [R] refresh  [q] close"
 
 local list_state = {
     buf = nil,
@@ -50,6 +52,7 @@ local list_state = {
 
 local log_streams = {}
 local log_float_wins = {}
+local task_quickfix_parser = {}
 local attach_log_view
 local update_task_list_preview
 local request_task_list_preview_update
@@ -74,6 +77,75 @@ local ansi_hl_by_code = {
     [96] = "Special",
     [97] = "Normal",
 }
+
+local quickfix_presets = {
+    gcc = {
+        efm = "%E%f:%l:%c: error: %m,%E%f:%l: error: %m,%W%f:%l:%c: warning: %m,%W%f:%l: warning: %m,%I%f:%l:%c: note: %m,%I%f:%l: note: %m,%E%f:%l:%c: fatal error: %m,%E%f:%l: fatal error: %m,%-G%.%#",
+    },
+    msvc = {
+        efm = "%f(%l,%c): %t%*[^:]: %m,%f(%l): %t%*[^:]: %m,%-G%.%#",
+    },
+    rust = {
+        efm = [=[%Eerror%\[%*[^]]%\]: %m,%Wwarning%\[%*[^]]%\]: %m,%C %#--> %f:%l:%c,%C %m,%-G%.%#]=],
+    },
+    go = {
+        efm = "%E%f:%l:%c: %m,%E%f:%l: %m,%W%f:%l:%c: %m,%W%f:%l: %m,%-G%.%#",
+    },
+    py = {
+        efm = [[%ETraceback (most recent call last):,%C  File "%f"\, line %l\, in %m,%C %m,%Z%[%^ :	]%\@=%m,%-G%.%#]],
+    },
+    pyt = {
+        efm = "%E%f:%l: in %m,%W%f:%l: %m,%C%m,%-G%.%#",
+    },
+    tsc = {
+        efm = [[%E%f(%l\,%c): error TS%n: %m,%W%f(%l\,%c): warning TS%n: %m,%-G%.%#]],
+    },
+    js = {
+        efm = "%E%f:%l:%c: error %m,%W%f:%l:%c: warning %m,%-G%.%#",
+    },
+    java = {
+        efm = "%E%f:%l: error: %m,%W%f:%l: warning: %m,%C%m,%-G%.%#",
+    },
+    lua = {
+        efm = "%E%f:%l: %m,%-G%.%#",
+    },
+}
+
+local quickfix_user_presets = {}
+
+local function merged_quickfix_presets()
+    local merged = vim.deepcopy(quickfix_presets)
+    for name, parser in pairs(quickfix_user_presets) do
+        if type(name) == "string" and type(parser) == "table" and type(parser.efm) == "string" and parser.efm ~= "" then
+            merged[name:lower()] = {
+                efm = parser.efm,
+            }
+        end
+    end
+    return merged
+end
+
+local function resolve_quickfix_errorformat(opts)
+    local presets = merged_quickfix_presets()
+
+    if opts and type(opts.errorformat) == "string" and opts.errorformat ~= "" then
+        return opts.errorformat
+    end
+
+    local parser = opts and opts.parser
+    if type(parser) ~= "string" or parser == "" or parser == "default" then
+        return vim.o.errorformat
+    end
+
+    local key = parser:lower()
+
+    local preset = presets[key]
+    if not preset then
+        return nil, string.format("unknown quickfix parser '%s'", parser)
+    end
+
+    return preset.efm
+end
 
 local function is_active_status(status)
     return status == "running" or status == "stopping"
@@ -631,7 +703,7 @@ local function ensure_task_list_preview_window()
         preview_cfg.height = preview_height
         preview_cfg.focusable = false
         preview_cfg.footer =
-        "[Enter] float log  [S] split  [V] vsplit  [T] tab  [s] stop  [r] rerun  [c] clear  [R] refresh  [q] close"
+        task_list_footer
         preview_cfg.footer_pos = "center"
         vim.api.nvim_win_set_config(list_state.preview_win, preview_cfg)
         vim.wo[list_state.preview_win].number = false
@@ -648,8 +720,7 @@ local function ensure_task_list_preview_window()
         width = preview_width,
         height = preview_height,
         focusable = false,
-        footer =
-        "[Enter] float log  [S] split  [V] vsplit  [T] tab  [s] stop  [r] rerun  [c] clear  [R] refresh  [q] close",
+        footer = task_list_footer,
         footer_pos = "center",
         style = "minimal",
     })
@@ -1454,6 +1525,96 @@ function M.open_task_log_tab(task_id)
     open_log_in_split(task_id, "tab")
 end
 
+function M.open_task_quickfix(task_id, opts)
+    local task_info, err = task.get(task_id)
+    if not task_info then
+        notify_err(err)
+        return
+    end
+
+    local id = tonumber(task_id)
+    opts = opts or {}
+    if id and type(opts.parser) == "string" and opts.parser ~= "" then
+        task_quickfix_parser[id] = opts.parser
+    end
+    if id and (not opts.parser or opts.parser == "") and task_quickfix_parser[id] then
+        opts.parser = task_quickfix_parser[id]
+    end
+    local snapshot, snapshot_err = read_all_output_lines(task_id)
+    if not snapshot then
+        notify_err(snapshot_err)
+        return
+    end
+
+    local plain_lines = {}
+    local active_hl = nil
+    for i, raw_line in ipairs(snapshot.lines) do
+        local plain, _, next_hl = parse_ansi_line(raw_line, active_hl)
+        plain_lines[i] = plain
+        active_hl = next_hl
+    end
+
+    local efm, efm_err = resolve_quickfix_errorformat(opts)
+    if not efm then
+        notify_err(efm_err)
+        return
+    end
+    local title = opts.title or string.format("Flyout #%d: %s", task_info.id, task_info.cmd)
+    local ok, set_err = pcall(vim.fn.setqflist, {}, " ", {
+        title = title,
+        lines = plain_lines,
+        efm = efm,
+    })
+    if not ok then
+        notify_err(tostring(set_err))
+        return
+    end
+
+    local qf = vim.fn.getqflist({ size = 1 })
+    local size = tonumber(qf.size) or 0
+    if size < 1 then
+        vim.notify(string.format("Flyout: no quickfix entries parsed for task #%d", task_id), vim.log.levels.WARN)
+        return
+    end
+
+    vim.cmd("copen")
+    pcall(function()
+        vim.cmd("cfirst")
+    end)
+end
+
+function M.set_task_quickfix_parser(task_id, parser)
+    local id = tonumber(task_id)
+    if not id then
+        return
+    end
+
+    if type(parser) == "string" and parser ~= "" then
+        task_quickfix_parser[id] = parser
+    else
+        task_quickfix_parser[id] = nil
+    end
+end
+
+function M.quickfix_parsers()
+    local names = {}
+    for name, _ in pairs(merged_quickfix_presets()) do
+        table.insert(names, name)
+    end
+    table.sort(names)
+    return names
+end
+
+function M.configure_quickfix(opts)
+    opts = opts or {}
+
+    if type(opts.parsers) == "table" then
+        quickfix_user_presets = vim.deepcopy(opts.parsers)
+    else
+        quickfix_user_presets = {}
+    end
+end
+
 function M.setup(opts)
     ui_opts = vim.tbl_deep_extend("force", {}, ui_defaults, opts or {})
 end
@@ -1537,6 +1698,9 @@ function M.open_task_list()
         task.clear_finished()
         render_task_list()
         vim.notify("Flyout: cleared finished tasks")
+    end, { buffer = buf, silent = true })
+    vim.keymap.set("n", "x", function()
+        with_selected_task(M.open_task_quickfix)
     end, { buffer = buf, silent = true })
 
     vim.api.nvim_create_autocmd("BufWipeout", {

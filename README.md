@@ -17,6 +17,7 @@ A lightweight background task launcher/manager for Neovim.
 - `:FlyoutRerun {id}` - rerun a task (same task entry/log file)
 - `:FlyoutTasks` - open task list window
 - `:FlyoutLog {id}` - open floating log window for a task
+- `:FlyoutQuickfix {parser} {cmd}` - run command as Flyout task, parse output with parser, then auto-open quickfix on first parsed entry
 
 ## Task List Keys
 
@@ -26,6 +27,7 @@ A lightweight background task launcher/manager for Neovim.
 - `T` open log in tab
 - `s` stop selected task
 - `r` rerun selected task
+- `x` parse selected task log into quickfix
 - `c` clear finished tasks
 - `R` refresh list
 - `q` close task list
@@ -47,8 +49,31 @@ require("flyout").setup({
         -- default is "50%"
         task_list_width = "50%",
     },
+    quickfix = {
+        -- auto-generate parser commands like :Fgcc, :Fmsvc, :Frust
+        generate_commands = true,
+
+        -- prefix for generated commands (for example "F" => :Fgcc)
+        command_prefix = "F",
+
+        -- optional: add or override parser definitions
+        parsers = {
+            -- custom parser
+            -- mylang = { efm = "%E%f:%l:%c: %m" },
+
+            -- override built-in parser
+            -- gcc = { efm = "%f:%l:%c: %m" },
+        },
+    },
 })
 ```
+
+### Quickfix Parsers
+
+- Built-in parser names: `gcc`, `msvc`, `rust`, `go`, `py`, `pyt`, `tsc`, `js`, `java`, `lua`
+- Generated commands use parser names with your prefix:
+  `:Fgcc`, `:Fmsvc`, `:Frust`, `:Fgo`, `:Fpy`, `:Fpyt`, `:Ftsc`, `:Fjs`, `:Fjava`, `:Flua`
+- You can extend or override parser definitions with `quickfix.parsers`
 
 ### Width Rules
 
