@@ -27,14 +27,17 @@ local preview_padding = {
 local ui_defaults = {
     preview_enabled = true,
     task_list_width = "50%",
-    task_list_height = 18,
-    preview_height = "match",
+    task_list_height = "25%",
+    preview_height = "40%",
 }
 
 local ui_opts = vim.deepcopy(ui_defaults)
 
 local list_min_width = nil
 local preview_gap = 0
+local list_zindex = 40
+local preview_zindex = 41
+local preview_border = { "├", "─", "┤", "│", "╯", "─", "╰", "│" }
 local task_list_footer =
 "[Enter] float log  [S] split  [V] vsplit  [T] tab  [x] quickfix  [s] stop  [r] rerun  [c] clear  [R] refresh  [q] close"
 
@@ -195,7 +198,7 @@ local function resolve_task_list_open_position(width, height, preview_height)
 
     if ui_opts.preview_enabled then
         local pheight = math.max(6, math.floor(preview_height or height))
-        local combined_outer_height = height + pheight + preview_gap + 4
+        local combined_outer_height = height + pheight + preview_gap + 3
         if combined_outer_height <= vim.o.lines then
             list_row = math.floor((vim.o.lines - combined_outer_height) / 2 - 1)
         end
@@ -237,7 +240,7 @@ local function resolve_width(value, total_columns, fallback)
 end
 
 local function resolve_task_list_height()
-    local fallback = 18
+    local fallback = "25%"
     local min_height = 8
     local height = resolve_width(ui_opts.task_list_height, vim.o.lines, fallback)
     height = math.max(min_height, math.floor(height))
@@ -246,11 +249,8 @@ local function resolve_task_list_height()
 end
 
 local function resolve_preview_height(list_height)
-    if ui_opts.preview_height == "match" or ui_opts.preview_height == nil then
-        return math.max(6, math.floor(list_height))
-    end
-
-    local height = resolve_width(ui_opts.preview_height, vim.o.lines, list_height)
+    local fallback = "40%"
+    local height = resolve_width(ui_opts.preview_height, vim.o.lines, fallback)
     height = math.max(6, math.floor(height))
     height = math.min(height, math.max(6, vim.o.lines - 4))
     return height
@@ -706,7 +706,7 @@ local function ensure_task_list_preview_window()
     local preview_col = 0
     local preview_row = 0
 
-    local combined_outer_height = list_height + preview_height + preview_gap + 4
+    local combined_outer_height = list_height + preview_height + preview_gap + 3
     if combined_outer_height > vim.o.lines then
         close_task_list_preview()
         center_task_list_window()
@@ -717,8 +717,9 @@ local function ensure_task_list_preview_window()
     local start_row = math.max(0, math.floor((vim.o.lines - combined_outer_height) / 2 - 1))
     cfg.col = list_col
     cfg.row = start_row
+    cfg.zindex = list_zindex
     preview_col = list_col
-    preview_row = start_row + list_height + preview_gap + 2
+    preview_row = start_row + list_height + preview_gap + 1
 
     vim.api.nvim_win_set_config(list_state.win, cfg)
 
@@ -728,6 +729,8 @@ local function ensure_task_list_preview_window()
         preview_cfg.col = math.max(0, math.floor(preview_col))
         preview_cfg.width = preview_width
         preview_cfg.height = preview_height
+        preview_cfg.zindex = preview_zindex
+        preview_cfg.border = preview_border
         preview_cfg.focusable = false
         preview_cfg.footer = task_list_footer
         preview_cfg.footer_pos = "center"
@@ -740,11 +743,12 @@ local function ensure_task_list_preview_window()
     local preview_buf = vim.api.nvim_create_buf(false, true)
     local preview_win = vim.api.nvim_open_win(preview_buf, false, {
         relative = "editor",
-        border = "rounded",
+        border = preview_border,
         row = math.max(0, math.floor(preview_row)),
         col = math.max(0, math.floor(preview_col)),
         width = preview_width,
         height = preview_height,
+        zindex = preview_zindex,
         focusable = false,
         footer = task_list_footer,
         footer_pos = "center",
@@ -1063,34 +1067,32 @@ local function stream_clear_body(view)
 end
 
 local function read_all_output_lines(task_id)
-    local all = {}
-    local start_line = 1
-    local last_next_line = 1
-
-    while true do
-        local chunk, read_err = task.read_output(task_id, {
-            start_line = start_line,
-            max_lines = 300,
-        })
-        if not chunk then
-            return nil, read_err
-        end
-
-        if #chunk.lines > 0 then
-            vim.list_extend(all, chunk.lines)
-        end
-        last_next_line = chunk.next_line
-
-        if chunk.eof then
-            break
-        end
-
-        start_line = chunk.next_line
+    local task_info, task_err = task.get(task_id)
+    if not task_info then
+        return nil, task_err
     end
+
+    if not (task_info.output_path and uv.fs_stat(task_info.output_path)) then
+        return {
+            lines = {},
+            next_line = 1,
+        }
+    end
+
+    local fd, open_err = io.open(task_info.output_path, "r")
+    if not fd then
+        return nil, open_err
+    end
+
+    local all = {}
+    for line in fd:lines() do
+        table.insert(all, line)
+    end
+    fd:close()
 
     return {
         lines = all,
-        next_line = last_next_line,
+        next_line = #all + 1,
     }
 end
 
@@ -1676,6 +1678,7 @@ function M.open_task_list()
         col = list_open_pos.col,
         width = list_min_width,
         height = list_height,
+        zindex = list_zindex,
         title = "Flyout Tasks",
         title_pos = "center",
         style = "minimal",
