@@ -1,12 +1,9 @@
 local M = {}
+local notifier = require("flyout.notifier")
 
 local state = {
     items = {},
 }
-
-local function next_notif_id(task_id)
-    return string.format("flyout-spinner-%d-%d", task_id, vim.uv.hrtime())
-end
 
 function M.set(task_id, text)
     local id = tonumber(task_id)
@@ -17,18 +14,20 @@ function M.set(task_id, text)
     local entry = state.items[id]
     if not entry then
         entry = {
-            notif_id = next_notif_id(id),
             handle = nil,
         }
         state.items[id] = entry
     end
 
-    entry.handle = vim.notify(text, vim.log.levels.INFO, {
-        id = entry.notif_id,
-        title = "Flyout",
+    local handle = notifier.notify(text, vim.log.levels.INFO, {
+        replace = entry.handle,
+        title = "Flyout running task",
         timeout = false,
         hide_from_history = true,
     })
+    if handle ~= nil then
+        entry.handle = handle
+    end
 end
 
 function M.remove(task_id)
@@ -42,15 +41,7 @@ function M.remove(task_id)
         return
     end
 
-    if entry.handle and type(entry.handle) == "table" and type(entry.handle.close) == "function" then
-        pcall(entry.handle.close, entry.handle)
-    end
-
-    pcall(vim.notify, " ", vim.log.levels.INFO, {
-        id = entry.notif_id,
-        timeout = 1,
-        hide_from_history = true,
-    })
+    notifier.close(entry.handle)
 
     state.items[id] = nil
 end

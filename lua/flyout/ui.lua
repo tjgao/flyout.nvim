@@ -2,8 +2,8 @@ local M = {}
 
 local uv = vim.uv
 local task = require("flyout.task")
+local notifier = require("flyout.notifier")
 local ns = vim.api.nvim_create_namespace("flyout-ui")
-local log_ns = vim.api.nvim_create_namespace("flyout-log")
 
 local col_width = {
     task = 7,
@@ -29,6 +29,7 @@ local ui_defaults = {
     task_list_width = "50%",
     task_list_height = "25%",
     preview_height = "40%",
+    log_terminal_scrollback = 200000,
 }
 
 local ui_opts = vim.deepcopy(ui_defaults)
@@ -39,7 +40,7 @@ local list_zindex = 40
 local preview_zindex = 41
 local preview_border = { "├", "─", "┤", "│", "╯", "─", "╰", "│" }
 local task_list_footer =
-"[Enter] float log  [S] split  [V] vsplit  [T] tab  [x] quickfix  [s] stop  [r] rerun  [c] clear  [R] refresh  [q] close"
+"[Enter] open  [s] stop  [dd] delete  [q] exit  [?] help"
 
 local list_state = {
     buf = nil,
@@ -55,33 +56,13 @@ local list_state = {
     preview_update_dirty = false,
 }
 
-local log_streams = {}
 local log_float_wins = {}
 local task_quickfix_parser = {}
-local attach_log_view
+local quickfix_parse_state = {}
 local update_task_list_preview
 local request_task_list_preview_update
+local open_preview_terminal
 local ensure_log_buffer
-local parse_ansi_line
-
-local ansi_hl_by_code = {
-    [30] = "Comment",
-    [31] = "DiagnosticError",
-    [32] = "DiagnosticOk",
-    [33] = "DiagnosticWarn",
-    [34] = "Identifier",
-    [35] = "Type",
-    [36] = "Special",
-    [37] = "Normal",
-    [90] = "Comment",
-    [91] = "DiagnosticError",
-    [92] = "DiagnosticOk",
-    [93] = "DiagnosticWarn",
-    [94] = "Identifier",
-    [95] = "Type",
-    [96] = "Special",
-    [97] = "Normal",
-}
 
 local quickfix_presets = {
     gcc = {
@@ -92,7 +73,7 @@ local quickfix_presets = {
         efm = "%f(%l,%c): %t%*[^:]: %m,%f(%l): %t%*[^:]: %m,%-G%.%#",
     },
     rust = {
-        efm = [=[%Eerror%\[%*[^]]%\]: %m,%Wwarning%\[%*[^]]%\]: %m,%C %#--> %f:%l:%c,%C %m,%-G%.%#]=],
+        efm = [=[%Eerror\[%*[^]]\]: %m,%Wwarning\[%*[^]]\]: %m,%C %#--> %f:%l:%c,%C %m,%-G%.%#]=],
     },
     go = {
         efm = "%E%f:%l:%c: %m,%E%f:%l: %m,%W%f:%l:%c: %m,%W%f:%l: %m,%-G%.%#",
@@ -151,6 +132,16 @@ local function resolve_quickfix_errorformat(opts)
     end
 
     return preset.efm
+end
+
+local function is_valid_errorformat(efm)
+    if type(efm) ~= "string" or efm == "" then
+        return false
+    end
+    return pcall(vim.fn.setqflist, {}, " ", {
+        lines = {},
+        efm = efm,
+    })
 end
 
 local function is_active_status(status)
@@ -218,7 +209,7 @@ local function stop_timer(timer)
 end
 
 local function notify_err(err)
-    vim.notify("Flyout: " .. err, vim.log.levels.ERROR)
+    notifier.notify("Flyout: " .. err, vim.log.levels.ERROR)
 end
 
 local function resolve_width(value, total_columns, fallback)
@@ -344,98 +335,6 @@ local function scroll_win_to_bottom(win, buf)
     vim.api.nvim_win_call(win, function()
         vim.fn.winrestview({ lnum = last, col = 0, topline = topline, leftcol = 0 })
     end)
-end
-
-local function read_tail_lines(path, max_lines)
-    if not path or max_lines < 1 or not uv.fs_stat(path) then
-        return {}, 1
-    end
-
-    local fd = io.open(path, "r")
-    if not fd then
-        return {}, 1
-    end
-
-    local ring = {}
-    local total = 0
-    for line in fd:lines() do
-        total = total + 1
-        local idx = ((total - 1) % max_lines) + 1
-        ring[idx] = line
-    end
-    fd:close()
-
-    local count = math.min(total, max_lines)
-    if count == 0 then
-        return {}, 1
-    end
-
-    local out = {}
-    if total <= max_lines then
-        for i = 1, count do
-            out[i] = ring[i]
-        end
-        return out, total + 1
-    end
-
-    local start = ((total - count) % max_lines) + 1
-    for i = 1, count do
-        local idx = ((start + i - 2) % max_lines) + 1
-        out[i] = ring[idx]
-    end
-    return out, total + 1
-end
-local function resolve_preview_tail_lines(preview_win)
-    local win_height = 30
-    if preview_win and vim.api.nvim_win_is_valid(preview_win) then
-        win_height = vim.api.nvim_win_get_height(preview_win)
-    end
-
-    return math.max(20, math.floor(win_height * 2))
-end
-
-local function build_task_snapshot_buffer(task_info, preview_win)
-    local preview_buf = vim.api.nvim_create_buf(false, true)
-    ensure_log_buffer(preview_buf)
-
-    local header = {
-        string.format("Task #%d [%s]", task_info.id, task_info.status),
-        task_info.cmd,
-        string.rep("-", 80),
-    }
-
-    local max_lines = resolve_preview_tail_lines(preview_win)
-
-    local raw_lines, next_line = read_tail_lines(task_info.output_path, max_lines)
-    local body_lines = {}
-    local highlights = {}
-    local active_hl = nil
-    for i, raw_line in ipairs(raw_lines) do
-        local plain, spans, next_hl = parse_ansi_line(raw_line, active_hl)
-        active_hl = next_hl
-        body_lines[i] = plain
-        if #spans > 0 then
-            highlights[i] = spans
-        end
-    end
-
-    local all_lines = with_preview_padding(vim.list_extend(header, body_lines))
-    vim.bo[preview_buf].modifiable = true
-    vim.api.nvim_buf_set_lines(preview_buf, 0, -1, false, all_lines)
-    vim.bo[preview_buf].modifiable = false
-    vim.api.nvim_buf_clear_namespace(preview_buf, log_ns, 0, -1)
-
-    for rel, spans in pairs(highlights) do
-        local row = preview_padding.y + 3 + rel - 1
-        for _, span in ipairs(spans) do
-            vim.api.nvim_buf_set_extmark(preview_buf, log_ns, row, span.start_col + preview_padding.x, {
-                end_col = span.end_col + preview_padding.x,
-                hl_group = span.hl_group,
-            })
-        end
-    end
-
-    return preview_buf, next_line
 end
 
 local function display_state(item)
@@ -821,27 +720,9 @@ update_task_list_preview = function()
         return
     end
 
-    if not is_active_status(task_info.status) then
-        local snapshot_buf = build_task_snapshot_buffer(task_info, preview_win)
-        vim.api.nvim_win_set_buf(preview_win, snapshot_buf)
-        list_state.preview_task_id = task_id
-        list_state.preview_started_at = task_info.started_at
-        scroll_win_to_bottom(preview_win, snapshot_buf)
-        return
-    end
-
-    local preview_buf, next_line = build_task_snapshot_buffer(task_info, preview_win)
-    vim.api.nvim_win_set_buf(preview_win, preview_buf)
-    attach_log_view(task_id, preview_buf, preview_win, {
-        show_header = true,
-        allow_close = false,
-        glance_only = true,
-        preserve_existing_body = true,
-        start_line = next_line,
-    })
+    open_preview_terminal(task_id, preview_win)
     list_state.preview_task_id = task_id
     list_state.preview_started_at = task_info.started_at
-    scroll_win_to_bottom(preview_win, preview_buf)
 end
 
 request_task_list_preview_update = function()
@@ -880,11 +761,51 @@ end
 local function with_selected_task(action)
     local task_id = current_task_id_from_list()
     if not task_id then
-        vim.notify("Flyout: no task selected", vim.log.levels.WARN)
+        notifier.notify("Flyout: no task selected", vim.log.levels.WARN)
         return
     end
     action(task_id)
     render_task_list()
+end
+
+local function open_task_list_help()
+    local lines = {
+        "Flyout Task List Help",
+        "",
+        "Enter  Open log float",
+        "S      Open log split",
+        "V      Open log vsplit",
+        "T      Open log tab",
+        "x      Parse quickfix",
+        "s      Stop task",
+        "r      Rerun task",
+        "dd     Delete task",
+        "c      Clear finished tasks",
+        "R      Refresh list",
+        "q/Esc  Close task list",
+        "",
+        "Press q or Esc to close this help.",
+    }
+
+    local width = 54
+    local height = #lines
+    local buf, win = make_float("Flyout Help", width, height)
+    ensure_log_buffer(buf)
+    vim.bo[buf].modifiable = true
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.bo[buf].modifiable = false
+    vim.wo[win].number = false
+    vim.wo[win].relativenumber = false
+    vim.keymap.set("n", "q", function()
+        if vim.api.nvim_win_is_valid(win) then
+            vim.api.nvim_win_close(win, true)
+        end
+    end, { buffer = buf, silent = true })
+    vim.keymap.set("n", "<Esc>", function()
+        if vim.api.nvim_win_is_valid(win) then
+            vim.api.nvim_win_close(win, true)
+        end
+    end, { buffer = buf, silent = true })
 end
 
 local function setup_list_autorefresh()
@@ -909,70 +830,102 @@ ensure_log_buffer = function(buf)
     vim.bo[buf].filetype = "flyout-log"
 end
 
-local function normalize_output_line(line)
-    if type(line) ~= "string" then
-        return ""
+local function read_file(path)
+    local fd = io.open(path, "r")
+    if not fd then
+        return nil
     end
-
-    if line:sub(-1) == "\r" then
-        line = line:sub(1, -2)
-    end
-
-    local last_cr = line:match(".*()\r")
-    if last_cr then
-        line = line:sub(last_cr + 1)
-    end
-
-    return (line:gsub("\r", ""))
+    local content = fd:read("*a")
+    fd:close()
+    return content
 end
 
-parse_ansi_line = function(line, active_hl)
-    line = normalize_output_line(line)
+local function unlink_file(path)
+    if path and path ~= "" then
+        pcall(uv.fs_unlink, path)
+    end
+end
 
-    local pieces = {}
-    local spans = {}
-    local col = 0
-    local idx = 1
-    local current_hl = active_hl
-
-    while true do
-        local s, e, codes = line:find("\27%[([%d;]*)m", idx)
-        local text_end = s and (s - 1) or #line
-        if text_end >= idx then
-            local chunk = line:sub(idx, text_end)
-            local chunk_len = #chunk
-            table.insert(pieces, chunk)
-            if current_hl and chunk_len > 0 then
-                table.insert(spans, {
-                    start_col = col,
-                    end_col = col + chunk_len,
-                    hl_group = current_hl,
-                })
-            end
-            col = col + chunk_len
-        end
-
-        if not s then
-            break
-        end
-
-        if codes == "" then
-            current_hl = nil
-        else
-            for code_str in codes:gmatch("%d+") do
-                local code = tonumber(code_str)
-                if code == 0 or code == 39 then
-                    current_hl = nil
-                elseif ansi_hl_by_code[code] then
-                    current_hl = ansi_hl_by_code[code]
-                end
-            end
-        end
-
-        idx = e + 1
+local function stop_quickfix_parse_ui(task_id)
+    local state = quickfix_parse_state[task_id]
+    if not state then
+        return
     end
 
-    return table.concat(pieces), spans, current_hl
+    if state.timer and not state.timer:is_closing() then
+        state.timer:stop()
+        state.timer:close()
+    end
+
+    if state.handle and type(state.handle) == "table" and type(state.handle.close) == "function" then
+        notifier.close(state.handle)
+    end
+end
+
+local function finish_quickfix_parse(task_id, payload)
+    local state = quickfix_parse_state[task_id]
+    if not state then
+        return
+    end
+
+    stop_quickfix_parse_ui(task_id)
+    quickfix_parse_state[task_id] = nil
+
+    for _, cb in ipairs(state.callbacks or {}) do
+        pcall(cb, payload or {})
+    end
+end
+
+local function begin_quickfix_parse(task_id, cmd, on_done)
+    local state = quickfix_parse_state[task_id]
+    if state then
+        if on_done then
+            table.insert(state.callbacks, on_done)
+        end
+        return false
+    end
+
+    local frames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+    state = {
+        idx = 1,
+        timer = nil,
+        handle = nil,
+        callbacks = {},
+    }
+    if on_done then
+        table.insert(state.callbacks, on_done)
+    end
+    quickfix_parse_state[task_id] = state
+
+    local function push()
+        local frame = frames[state.idx]
+        state.idx = (state.idx % #frames) + 1
+        local handle = notifier.notify(string.format("%s parsing quickfix #%d: %s", frame, task_id, cmd), vim.log.levels.INFO, {
+            replace = state.handle,
+            title = "Flyout",
+            timeout = false,
+            hide_from_history = true,
+        })
+        if handle ~= nil then
+            state.handle = handle
+        end
+    end
+
+    push()
+    local timer = uv.new_timer()
+    if timer then
+        state.timer = timer
+        timer:start(120, 120, function()
+            vim.schedule(function()
+                if quickfix_parse_state[task_id] ~= state then
+                    return
+                end
+                push()
+            end)
+        end)
+    end
+
+    return true
 end
 
 local function focus_task_list_window()
@@ -1011,255 +964,30 @@ local function set_log_buffer_name(buf, task_id, cmd)
     pcall(vim.api.nvim_buf_set_name, buf, string.format("%s [%d]", base, buf))
 end
 
-local function stream_iter_views(stream, callback)
-    local stale = {}
-    for buf, view in pairs(stream.views) do
-        if not vim.api.nvim_buf_is_valid(buf) then
-            table.insert(stale, buf)
-        else
-            callback(view)
-        end
-    end
-    for _, buf in ipairs(stale) do
-        stream.views[buf] = nil
-    end
+local function shell_quote_single(value)
+    return "'" .. tostring(value):gsub("'", [['"'"']]) .. "'"
 end
 
-local function stream_set_header(view, task_info)
-    if view.header_lines == 0 or not vim.api.nvim_buf_is_valid(view.buf) then
-        return
-    end
-
-    local header = {
-        string.format("Task #%d [%s]", task_info.id, task_info.status),
-        task_info.cmd,
-        string.rep("-", 80),
-    }
-
-    if view.left_padding_cols and view.left_padding_cols > 0 then
-        for i = 1, #header do
-            header[i] = preview_pad_line(header[i])
-        end
-    end
-
-    local header_start = view.top_padding_lines or 0
-    local header_end = header_start + view.header_lines
-    vim.bo[view.buf].modifiable = true
-    vim.api.nvim_buf_set_lines(view.buf, header_start, header_end, false, header)
-    vim.bo[view.buf].modifiable = false
+local function terminal_follow_command(path)
+    return string.format("tail -n +1 -f -- %s", shell_quote_single(path))
 end
 
-local function stream_clear_body(view)
-    if not vim.api.nvim_buf_is_valid(view.buf) then
-        return
+local function terminal_scrollback_value()
+    local value = tonumber(ui_opts.log_terminal_scrollback)
+    if not value then
+        value = 200000
     end
-    local body_start = (view.top_padding_lines or 0) + view.header_lines
-    local body_end = vim.api.nvim_buf_line_count(view.buf) - (view.bottom_padding_lines or 0)
-    if body_end < body_start then
-        body_end = body_start
+    value = math.floor(value)
+    if value == -1 then
+        return 1000000
     end
-
-    vim.bo[view.buf].modifiable = true
-    vim.api.nvim_buf_set_lines(view.buf, body_start, body_end, false, {})
-    vim.bo[view.buf].modifiable = false
-    vim.api.nvim_buf_clear_namespace(view.buf, log_ns, body_start, -1)
-    view.ansi_hl_state = nil
+    if value < 1 then
+        return 1
+    end
+    return value
 end
 
-local function read_all_output_lines(task_id)
-    local task_info, task_err = task.get(task_id)
-    if not task_info then
-        return nil, task_err
-    end
-
-    if not (task_info.output_path and uv.fs_stat(task_info.output_path)) then
-        return {
-            lines = {},
-            next_line = 1,
-        }
-    end
-
-    local fd, open_err = io.open(task_info.output_path, "r")
-    if not fd then
-        return nil, open_err
-    end
-
-    local all = {}
-    for line in fd:lines() do
-        table.insert(all, line)
-    end
-    fd:close()
-
-    return {
-        lines = all,
-        next_line = #all + 1,
-    }
-end
-
-local function stream_append_lines(view, lines)
-    if #lines == 0 or not vim.api.nvim_buf_is_valid(view.buf) then
-        return
-    end
-
-    local follow = false
-    if view.win and vim.api.nvim_win_is_valid(view.win) and vim.api.nvim_win_get_buf(view.win) == view.buf then
-        local cursor = vim.api.nvim_win_get_cursor(view.win)
-        local last_line = vim.api.nvim_buf_line_count(view.buf)
-        follow = cursor[1] >= last_line
-    end
-
-    local rendered = {}
-    local highlights = {}
-    local left_padding_cols = view.left_padding_cols or 0
-    local active_hl = view.ansi_hl_state
-    local line_padding = ""
-    if left_padding_cols > 0 then
-        line_padding = string.rep(" ", left_padding_cols)
-    end
-    for i, raw_line in ipairs(lines) do
-        local plain, spans, next_hl = parse_ansi_line(raw_line, active_hl)
-        active_hl = next_hl
-        if left_padding_cols > 0 then
-            rendered[i] = line_padding .. plain .. line_padding
-        else
-            rendered[i] = plain
-        end
-        if #spans > 0 then
-            highlights[i] = spans
-        end
-    end
-    view.ansi_hl_state = active_hl
-
-    local start_idx = vim.api.nvim_buf_line_count(view.buf) - (view.bottom_padding_lines or 0)
-    vim.bo[view.buf].modifiable = true
-    vim.api.nvim_buf_set_lines(view.buf, start_idx, start_idx, false, rendered)
-    vim.bo[view.buf].modifiable = false
-
-    for rel, spans in pairs(highlights) do
-        local row = start_idx + rel - 1
-        for _, span in ipairs(spans) do
-            vim.api.nvim_buf_set_extmark(view.buf, log_ns, row, span.start_col + left_padding_cols, {
-                end_col = span.end_col + left_padding_cols,
-                hl_group = span.hl_group,
-            })
-        end
-    end
-
-    local max_body_lines = nil
-    if view.glance_only then
-        max_body_lines = resolve_preview_tail_lines(view.win)
-    end
-    if type(max_body_lines) == "number" and max_body_lines > 0 then
-        local total_lines = vim.api.nvim_buf_line_count(view.buf)
-        local body_lines = math.max(
-            0,
-            total_lines - (view.top_padding_lines or 0) - view.header_lines - (view.bottom_padding_lines or 0)
-        )
-        local overflow = body_lines - max_body_lines
-        if overflow > 0 then
-            local delete_start = (view.top_padding_lines or 0) + view.header_lines
-            local delete_end = delete_start + overflow
-            vim.bo[view.buf].modifiable = true
-            vim.api.nvim_buf_set_lines(view.buf, delete_start, delete_end, false, {})
-            vim.bo[view.buf].modifiable = false
-        end
-    end
-
-    if
-        follow
-        and view.win
-        and vim.api.nvim_win_is_valid(view.win)
-        and vim.api.nvim_win_get_buf(view.win) == view.buf
-    then
-        scroll_win_to_bottom(view.win, view.buf)
-    end
-end
-
-local function ensure_stream_timer(stream)
-    if stream.timer and not stream.timer:is_closing() then
-        return
-    end
-    stream.timer = uv.new_timer()
-    stream.timer:start(0, 400, function()
-        vim.schedule(function()
-            local current = log_streams[stream.task_id]
-            if not current then
-                return
-            end
-
-            stream_iter_views(current, function() end)
-            if not next(current.views) then
-                stop_timer(current.timer)
-                log_streams[current.task_id] = nil
-                return
-            end
-
-            local latest, latest_err = task.get(current.task_id)
-            if not latest then
-                notify_err(latest_err)
-                return
-            end
-
-            if latest.started_at ~= current.started_at then
-                current.started_at = latest.started_at
-                current.next_line = 1
-                stream_iter_views(current, stream_clear_body)
-            end
-
-            local chunk, read_err = task.read_output(current.task_id, {
-                start_line = current.next_line,
-                max_lines = 300,
-            })
-            if not chunk then
-                notify_err(read_err)
-                return
-            end
-
-            current.next_line = chunk.next_line
-            stream_iter_views(current, function(view)
-                stream_append_lines(view, chunk.lines)
-                stream_set_header(view, latest)
-            end)
-
-            if chunk.eof and not is_active_status(latest.status) then
-                stop_timer(current.timer)
-                current.timer = nil
-            end
-        end)
-    end)
-end
-
-local function ensure_log_stream(task_id, task_info)
-    local stream = log_streams[task_id]
-    if stream then
-        ensure_stream_timer(stream)
-        return stream
-    end
-
-    stream = {
-        task_id = task_id,
-        started_at = task_info.started_at,
-        next_line = 1,
-        timer = nil,
-        views = {},
-    }
-    log_streams[task_id] = stream
-    ensure_stream_timer(stream)
-    return stream
-end
-
-local function notify_task_restarted(task_id, started_at)
-    local stream = log_streams[task_id]
-    if not stream then
-        return
-    end
-    stream.started_at = started_at
-    stream.next_line = 1
-    stream_iter_views(stream, stream_clear_body)
-    ensure_stream_timer(stream)
-end
-
-attach_log_view = function(task_id, buf, win, opts)
+local function attach_terminal_log_view(task_id, buf, win, opts)
     local task_info, err = task.get(task_id)
     if not task_info then
         notify_err(err)
@@ -1267,155 +995,82 @@ attach_log_view = function(task_id, buf, win, opts)
     end
 
     opts = opts or {}
-    ensure_log_buffer(buf)
-
-    local header_lines = opts.show_header and 3 or 0
     local allow_close = opts.allow_close ~= false
     local allow_task_actions = opts.allow_task_actions ~= false
     local allow_open_targets = opts.allow_open_targets == true
-    local focus_task_list_on_close = opts.focus_task_list_on_close == true
-    local preserve_existing_body = opts.preserve_existing_body == true
-    local start_line_override = tonumber(opts.start_line)
-    local glance_only = opts.glance_only == true
-    local top_padding_lines = 0
-    local bottom_padding_lines = 0
-    local left_padding_cols = 0
 
-    if glance_only then
-        top_padding_lines = preview_padding.y
-        bottom_padding_lines = preview_padding.y
-        left_padding_cols = preview_padding.x
-    end
+    vim.bo[buf].bufhidden = "wipe"
+    vim.bo[buf].buflisted = false
 
-    if type(opts.top_padding_lines) == "number" and opts.top_padding_lines >= 0 then
-        top_padding_lines = math.floor(opts.top_padding_lines)
-    end
-    if type(opts.bottom_padding_lines) == "number" and opts.bottom_padding_lines >= 0 then
-        bottom_padding_lines = math.floor(opts.bottom_padding_lines)
-    end
-    if type(opts.left_padding_cols) == "number" and opts.left_padding_cols >= 0 then
-        left_padding_cols = math.floor(opts.left_padding_cols)
+    local cmd = terminal_follow_command(task_info.output_path)
+    local ok_termopen, chan = pcall(function()
+        return vim.api.nvim_win_call(win, function()
+            return vim.fn.jobstart({ "sh", "-c", cmd }, { term = true })
+        end)
+    end)
+    if not ok_termopen or type(chan) ~= "number" or chan <= 0 then
+        notify_err("failed to open terminal log view")
+        return
     end
 
-    local view = {
-        task_id = task_id,
-        buf = buf,
-        win = win,
-        header_lines = header_lines,
-        glance_only = glance_only,
-        top_padding_lines = top_padding_lines,
-        bottom_padding_lines = bottom_padding_lines,
-        left_padding_cols = left_padding_cols,
-        ansi_hl_state = nil,
-    }
+    set_log_buffer_name(buf, task_id, task_info.cmd)
+    vim.schedule(function()
+        if vim.api.nvim_buf_is_valid(buf) then
+            set_log_buffer_name(buf, task_id, task_info.cmd)
+        end
+    end)
+
+    pcall(vim.api.nvim_set_option_value, "scrollback", terminal_scrollback_value(), { buf = buf })
 
     if win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
-        vim.wo[win].scrolloff = 0
-        vim.wo[win].number = not glance_only
+        vim.wo[win].number = false
         vim.wo[win].relativenumber = false
-    end
-
-    if not glance_only then
-        set_log_buffer_name(buf, task_id, task_info.cmd)
-    end
-
-    vim.bo[buf].modifiable = true
-    if header_lines > 0 then
-        local header = {
-            string.format("Task #%d [%s]", task_info.id, task_info.status),
-            task_info.cmd,
-            string.rep("-", 80),
-        }
-        if view.left_padding_cols > 0 then
-            for i = 1, #header do
-                header[i] = pad_line_with_cols(header[i], view.left_padding_cols)
+        vim.wo[win].cursorline = false
+        vim.defer_fn(function()
+            if win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
+                scroll_win_to_bottom(win, buf)
             end
-        end
-
-        local top_padding = {}
-        for _ = 1, view.top_padding_lines do
-            table.insert(top_padding, "")
-        end
-
-        if preserve_existing_body then
-            vim.api.nvim_buf_set_lines(
-                buf,
-                0,
-                view.top_padding_lines + header_lines,
-                false,
-                vim.list_extend(top_padding, header)
-            )
-        else
-            local initial = vim.list_extend(top_padding, header)
-            for _ = 1, view.bottom_padding_lines do
-                table.insert(initial, "")
-            end
-            vim.api.nvim_buf_set_lines(buf, 0, -1, false, initial)
-        end
-    elseif not preserve_existing_body then
-        if view.top_padding_lines > 0 or view.bottom_padding_lines > 0 then
-            local initial = {}
-            for _ = 1, view.top_padding_lines + view.bottom_padding_lines do
-                table.insert(initial, "")
-            end
-            vim.api.nvim_buf_set_lines(buf, 0, -1, false, initial)
-        else
-            vim.api.nvim_buf_set_lines(buf, 0, -1, false, {})
-        end
+        end, 60)
     end
-    vim.bo[buf].modifiable = false
-
-    local stream = ensure_log_stream(task_id, task_info)
-    if start_line_override and start_line_override > stream.next_line then
-        stream.next_line = math.floor(start_line_override)
-    end
-
-    if not preserve_existing_body then
-        local snapshot, snapshot_err = read_all_output_lines(task_id)
-        if not snapshot then
-            notify_err(snapshot_err)
-        else
-            if #snapshot.lines > 0 then
-                stream_append_lines(view, snapshot.lines)
-            end
-            if stream.next_line < snapshot.next_line then
-                stream.next_line = snapshot.next_line
-            end
-        end
-    end
-    stream.views[buf] = view
 
     if allow_close then
         vim.keymap.set("n", "q", function()
-            local win_to_close = nil
-            if view.win and vim.api.nvim_win_is_valid(view.win) and vim.api.nvim_win_get_buf(view.win) == buf then
-                win_to_close = view.win
+            local target = nil
+            if win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
+                target = win
             else
                 local current = vim.api.nvim_get_current_win()
                 if vim.api.nvim_win_is_valid(current) and vim.api.nvim_win_get_buf(current) == buf then
-                    win_to_close = current
+                    target = current
                 end
             end
 
-            if not win_to_close then
-                return
+            if target and vim.api.nvim_win_is_valid(target) then
+                vim.api.nvim_win_close(target, true)
+            end
+        end, { buffer = buf, silent = true })
+        vim.keymap.set("n", "<Esc>", function()
+            local target = nil
+            if win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
+                target = win
+            else
+                local current = vim.api.nvim_get_current_win()
+                if vim.api.nvim_win_is_valid(current) and vim.api.nvim_win_get_buf(current) == buf then
+                    target = current
+                end
             end
 
-            if focus_task_list_on_close then
-                focus_task_list_window()
-            end
-
-            if vim.api.nvim_win_is_valid(win_to_close) then
-                vim.api.nvim_win_close(win_to_close, true)
+            if target and vim.api.nvim_win_is_valid(target) then
+                vim.api.nvim_win_close(target, true)
             end
         end, { buffer = buf, silent = true })
     end
+
     if allow_task_actions then
         vim.keymap.set("n", "s", function()
             local _, stop_err = task.stop(task_id)
             if stop_err then
                 notify_err(stop_err)
-                return
             end
         end, { buffer = buf, silent = true })
         vim.keymap.set("n", "r", function()
@@ -1424,15 +1079,9 @@ attach_log_view = function(task_id, buf, win, opts)
                 notify_err(restart_err)
                 return
             end
-            notify_task_restarted(task_id, restarted.started_at)
         end, { buffer = buf, silent = true })
     end
-    vim.keymap.set("n", "G", function()
-        if view.win and vim.api.nvim_win_is_valid(view.win) and vim.api.nvim_win_get_buf(view.win) == buf then
-            local total = vim.api.nvim_buf_line_count(buf)
-            vim.api.nvim_win_set_cursor(view.win, { total, 0 })
-        end
-    end, { buffer = buf, silent = true })
+
     if allow_open_targets then
         vim.keymap.set("n", "<C-s>", function()
             M.open_task_log_split(task_id)
@@ -1449,24 +1098,25 @@ attach_log_view = function(task_id, buf, win, opts)
         buffer = buf,
         once = true,
         callback = function()
-            local current = log_streams[task_id]
-            if not current then
-                return
-            end
-            current.views[buf] = nil
-            if not next(current.views) then
-                stop_timer(current.timer)
-                log_streams[task_id] = nil
-            end
             local float_win = log_float_wins[task_id]
-            if float_win then
-                if not vim.api.nvim_win_is_valid(float_win) then
-                    log_float_wins[task_id] = nil
-                elseif vim.api.nvim_win_get_buf(float_win) == buf then
-                    log_float_wins[task_id] = nil
-                end
+            if float_win and (not vim.api.nvim_win_is_valid(float_win) or vim.api.nvim_win_get_buf(float_win) == buf) then
+                log_float_wins[task_id] = nil
             end
         end,
+    })
+end
+
+open_preview_terminal = function(task_id, preview_win)
+    if not (preview_win and vim.api.nvim_win_is_valid(preview_win)) then
+        return
+    end
+
+    local preview_buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_win_set_buf(preview_win, preview_buf)
+    attach_terminal_log_view(task_id, preview_buf, preview_win, {
+        allow_close = false,
+        allow_task_actions = false,
+        allow_open_targets = false,
     })
 end
 
@@ -1505,7 +1155,7 @@ local function open_log_in_split(task_id, kind)
     local win = vim.api.nvim_get_current_win()
     local buf = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_win_set_buf(win, buf)
-    attach_log_view(task_id, buf, win, { show_header = false })
+    attach_terminal_log_view(task_id, buf, win, { show_header = false })
 
     if source_tab and vim.api.nvim_tabpage_is_valid(source_tab) then
         vim.api.nvim_set_current_tabpage(source_tab)
@@ -1532,12 +1182,11 @@ function M.open_task_log(task_id)
     )
     log_float_wins[task_id] = win
     vim.wo[win].scrolloff = 0
-    attach_log_view(task_id, buf, win, {
+    attach_terminal_log_view(task_id, buf, win, {
         show_header = true,
         allow_task_actions = false,
         allow_open_targets = true,
     })
-    scroll_win_to_bottom(win, buf)
 
     vim.api.nvim_create_autocmd("WinClosed", {
         once = true,
@@ -1564,59 +1213,134 @@ function M.open_task_log_tab(task_id)
 end
 
 function M.open_task_quickfix(task_id, opts)
+    opts = opts or {}
+    local on_done = type(opts.on_done) == "function" and opts.on_done or nil
+    local show_parse_ui = on_done == nil
+    local function finish(payload)
+        local id = tonumber(task_id)
+        if id and quickfix_parse_state[id] then
+            finish_quickfix_parse(id, payload)
+            return
+        end
+        if on_done then
+            pcall(on_done, payload or {})
+        end
+    end
+
     local task_info, err = task.get(task_id)
     if not task_info then
         notify_err(err)
+        finish({ ok = false, err = err })
         return
     end
 
     local id = tonumber(task_id)
-    opts = opts or {}
+    if show_parse_ui and id and not begin_quickfix_parse(id, task_info.cmd, on_done) then
+        return
+    end
     if id and type(opts.parser) == "string" and opts.parser ~= "" then
         task_quickfix_parser[id] = opts.parser
     end
     if id and (not opts.parser or opts.parser == "") and task_quickfix_parser[id] then
         opts.parser = task_quickfix_parser[id]
     end
-    local snapshot, snapshot_err = read_all_output_lines(task_id)
-    if not snapshot then
-        notify_err(snapshot_err)
-        return
-    end
-
-    local plain_lines = {}
-    local active_hl = nil
-    for i, raw_line in ipairs(snapshot.lines) do
-        local plain, _, next_hl = parse_ansi_line(raw_line, active_hl)
-        plain_lines[i] = plain
-        active_hl = next_hl
-    end
-
     local efm, efm_err = resolve_quickfix_errorformat(opts)
     if not efm then
         notify_err(efm_err)
-        return
-    end
-    local title = opts.title or string.format("Flyout #%d: %s", task_info.id, task_info.cmd)
-    local ok, set_err = pcall(vim.fn.setqflist, {}, " ", {
-        title = title,
-        lines = plain_lines,
-        efm = efm,
-    })
-    if not ok then
-        notify_err(tostring(set_err))
+        finish({ ok = false, err = efm_err })
         return
     end
 
-    local qf = vim.fn.getqflist({ size = 1 })
-    local size = tonumber(qf.size) or 0
-    if size < 1 then
+    if not is_valid_errorformat(efm) then
+        local parser_name = opts.parser or "default"
+        local parser_key = type(parser_name) == "string" and parser_name:lower() or nil
+        local builtin = parser_key and quickfix_presets[parser_key] and quickfix_presets[parser_key].efm or nil
+        if builtin and builtin ~= efm and is_valid_errorformat(builtin) then
+            efm = builtin
+        else
+            local msg = string.format("invalid quickfix errorformat for parser '%s'", parser_name)
+            notify_err(msg)
+            finish({ ok = false, err = msg })
+            return
+        end
+    end
+
+    local worker_script = vim.api.nvim_get_runtime_file("lua/flyout/quickfix_worker.lua", false)[1]
+    if not worker_script then
+        notify_err("quickfix worker script not found")
+        finish({ ok = false, err = "quickfix worker script not found" })
         return
     end
 
-    vim.cmd("copen")
-    pcall(function()
-        vim.cmd("cfirst")
+    local out_file = vim.fn.tempname()
+
+    vim.system({
+        vim.v.progpath,
+        "--clean",
+        "--headless",
+        "--noplugin",
+        "-u",
+        "NONE",
+        "-l",
+        worker_script,
+    }, {
+        text = true,
+        env = {
+            FLYOUT_QF_LOG = task_info.output_path,
+            FLYOUT_QF_EFM = efm,
+            FLYOUT_QF_OUT = out_file,
+        },
+    }, function(obj)
+        vim.schedule(function()
+            if obj.code ~= 0 then
+                unlink_file(out_file)
+                local stderr = (obj.stderr or ""):gsub("%s+$", "")
+                if stderr == "" then
+                    stderr = "quickfix parser worker failed"
+                end
+                local parser_name = opts.parser or task_quickfix_parser[id] or "default"
+                local msg = string.format("quickfix parser '%s' failed: %s", parser_name, stderr)
+                notify_err(msg)
+                finish({ ok = false, err = msg })
+                return
+            end
+
+            local payload = read_file(out_file)
+            unlink_file(out_file)
+            if type(payload) ~= "string" then
+                notify_err("failed to read quickfix parser output")
+                finish({ ok = false, err = "failed to read quickfix parser output" })
+                return
+            end
+
+            local ok_decode, items = pcall(vim.json.decode, payload)
+            if not ok_decode or type(items) ~= "table" then
+                notify_err("failed to decode quickfix parser output")
+                finish({ ok = false, err = "failed to decode quickfix parser output" })
+                return
+            end
+
+            local title = opts.title or string.format("Flyout #%d: %s", task_info.id, task_info.cmd)
+            local ok_set, set_err = pcall(vim.fn.setqflist, {}, " ", {
+                title = title,
+                items = items,
+            })
+            if not ok_set then
+                notify_err(tostring(set_err))
+                finish({ ok = false, err = tostring(set_err) })
+                return
+            end
+
+            local qf = vim.fn.getqflist({ size = 1 })
+            local size = tonumber(qf.size) or 0
+            if size < 1 then
+                finish({ ok = true, count = 0 })
+                return
+            end
+
+            vim.cmd("copen")
+            finish({ ok = true, count = size })
+        end)
     end)
 end
 
@@ -1630,6 +1354,51 @@ function M.set_task_quickfix_parser(task_id, parser)
         task_quickfix_parser[id] = parser
     else
         task_quickfix_parser[id] = nil
+    end
+end
+
+function M.release_task_resources(task_id)
+    local id = tonumber(task_id)
+    if not id then
+        return
+    end
+
+    task_quickfix_parser[id] = nil
+    if quickfix_parse_state[id] then
+        stop_quickfix_parse_ui(id)
+        quickfix_parse_state[id] = nil
+    end
+
+    local float_win = log_float_wins[id]
+    if float_win and vim.api.nvim_win_is_valid(float_win) then
+        pcall(vim.api.nvim_win_close, float_win, true)
+    end
+    log_float_wins[id] = nil
+
+    local prefix = string.format("#%d:", id)
+    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_valid(buf) then
+            local ft = vim.bo[buf].filetype
+            if ft == "flyout-log" then
+                local name = vim.api.nvim_buf_get_name(buf)
+                if type(name) == "string" and name:sub(1, #prefix) == prefix then
+                    for _, win in ipairs(vim.fn.win_findbuf(buf)) do
+                        if vim.api.nvim_win_is_valid(win) then
+                            pcall(vim.api.nvim_win_close, win, true)
+                        end
+                    end
+                    if vim.api.nvim_buf_is_valid(buf) then
+                        pcall(vim.api.nvim_buf_delete, buf, { force = true })
+                    end
+                end
+            end
+        end
+    end
+
+    if list_state.preview_task_id == id then
+        list_state.preview_task_id = nil
+        list_state.preview_started_at = nil
+        request_task_list_preview_update()
     end
 end
 
@@ -1696,8 +1465,14 @@ function M.open_task_list()
             vim.api.nvim_win_close(win, true)
         end
     end, { buffer = buf, silent = true })
+    vim.keymap.set("n", "<Esc>", function()
+        if vim.api.nvim_win_is_valid(win) then
+            vim.api.nvim_win_close(win, true)
+        end
+    end, { buffer = buf, silent = true })
 
     vim.keymap.set("n", "R", render_task_list, { buffer = buf, silent = true })
+    vim.keymap.set("n", "?", open_task_list_help, { buffer = buf, silent = true })
     vim.keymap.set("n", "<CR>", function()
         local task_id = current_task_id_from_list()
         if task_id then
@@ -1720,7 +1495,6 @@ function M.open_task_list()
                 notify_err(err)
                 return
             end
-            notify_task_restarted(task_id, started.started_at)
         end)
     end, { buffer = buf, silent = true })
     vim.keymap.set("n", "S", function()
@@ -1735,7 +1509,17 @@ function M.open_task_list()
     vim.keymap.set("n", "c", function()
         task.clear_finished()
         render_task_list()
-        vim.notify("Flyout: cleared finished tasks")
+        notifier.notify("Flyout: cleared finished tasks")
+    end, { buffer = buf, silent = true })
+    vim.keymap.set("n", "dd", function()
+        with_selected_task(function(task_id)
+            local _, err = task.delete(task_id)
+            if err then
+                notify_err(err)
+                return
+            end
+            M.release_task_resources(task_id)
+        end)
     end, { buffer = buf, silent = true })
     vim.keymap.set("n", "x", function()
         with_selected_task(M.open_task_quickfix)

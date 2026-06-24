@@ -3,6 +3,7 @@ local M = {}
 local task = require("flyout.task")
 local ui = require("flyout.ui")
 local spinner_notifier = require("flyout.spinner_notifier")
+local notifier = require("flyout.notifier")
 
 local quickfix_defaults = {
     generate_commands = true,
@@ -22,6 +23,7 @@ local notification_defaults = {
 local generated_quickfix_commands = {}
 local event_listener_ids = {}
 local progress_state = {}
+local quickfix_postprocess = {}
 
 local function is_active_status(status)
     return status == "pending" or status == "running" or status == "stopping"
@@ -110,6 +112,32 @@ local function stop_progress(task_id)
     progress_state[task_id] = nil
 end
 
+local function notify_task_end(task_info)
+    if task_info.status == "success" then
+        notifier.notify(string.format("Flyout: task #%d finished", task_info.id))
+    elseif task_info.status == "timeout" then
+        notifier.notify(string.format("Flyout: task #%d timed out", task_info.id), vim.log.levels.WARN)
+    elseif task_info.status == "stopped" or task_info.status == "killed" then
+        notifier.notify(string.format("Flyout: task #%d stopped", task_info.id), vim.log.levels.WARN)
+    else
+        notifier.notify(string.format("Flyout: task #%d failed", task_info.id), vim.log.levels.ERROR)
+    end
+end
+
+local function complete_quickfix_postprocess(task_id)
+    local pending = quickfix_postprocess[task_id]
+    if not pending then
+        return
+    end
+
+    quickfix_postprocess[task_id] = nil
+    stop_progress(task_id)
+
+    if pending.notify_cfg and pending.notify_cfg["end"] and pending.task_info then
+        notify_task_end(pending.task_info)
+    end
+end
+
 local function start_progress(task_info, notify_cfg)
     if not notify_cfg.progress.enabled then
         return
@@ -147,10 +175,12 @@ local function start_progress(task_info, notify_cfg)
             local current, err = task.get(task_info.id)
             if not current then
                 stop_progress(task_info.id)
-                vim.notify("Flyout: " .. err, vim.log.levels.ERROR)
+                quickfix_postprocess[task_info.id] = nil
                 return
             end
-            if not is_progress_active_status(current.status) then
+            local quickfix_pending = quickfix_postprocess[current.id]
+            local quickfix_parsing = quickfix_pending and quickfix_pending.parsing == true
+            if not is_progress_active_status(current.status) and not quickfix_pending then
                 stop_progress(task_info.id)
                 return
             end
@@ -158,6 +188,9 @@ local function start_progress(task_info, notify_cfg)
             local frame = frames[state.idx]
             state.idx = (state.idx % #frames) + 1
             local msg = string.format("%s #%d %s", frame, current.id, current.cmd)
+            if quickfix_parsing then
+                msg = string.format("%s #%d parsing quickfix: %s", frame, current.id, current.cmd)
+            end
             spinner_notifier.set(current.id, msg)
         end)
     end)
@@ -173,7 +206,7 @@ end
 local function add_listener(event, callback)
     local id, err = task.on(event, callback)
     if not id then
-        vim.notify("Flyout: " .. tostring(err), vim.log.levels.ERROR)
+        notifier.notify("Flyout: " .. tostring(err), vim.log.levels.ERROR)
         return
     end
     table.insert(event_listener_ids, {
@@ -191,7 +224,7 @@ local function setup_notifications(opts)
         local task_info = payload.task
         local notify_cfg = task_notify_config(task_info)
         if notify_cfg.start then
-            vim.notify(string.format("Flyout: started task #%d", task_info.id))
+            notifier.notify(string.format("Flyout: started task #%d", task_info.id))
         end
         start_progress(task_info, notify_cfg)
     end)
@@ -210,29 +243,35 @@ local function setup_notifications(opts)
 
     add_listener("exit", function(payload)
         local task_info = payload.task
-        stop_progress(task_info.id)
-
         local notify_cfg = task_notify_config(task_info)
-        if not notify_cfg["end"] then
+        local pending = quickfix_postprocess[task_info.id]
+        if pending then
+            pending.task_info = task_info
+            pending.notify_cfg = notify_cfg
+            if task_info.status == "stopped" or task_info.status == "killed" then
+                complete_quickfix_postprocess(task_info.id)
+            end
             return
         end
 
-        if task_info.status == "success" then
-            vim.notify(string.format("Flyout: task #%d finished", task_info.id))
-        elseif task_info.status == "timeout" then
-            vim.notify(string.format("Flyout: task #%d timed out", task_info.id), vim.log.levels.WARN)
-        elseif task_info.status == "stopped" or task_info.status == "killed" then
-            vim.notify(string.format("Flyout: task #%d stopped", task_info.id), vim.log.levels.WARN)
-        else
-            vim.notify(string.format("Flyout: task #%d failed", task_info.id), vim.log.levels.ERROR)
+        stop_progress(task_info.id)
+        if notify_cfg["end"] then
+            notify_task_end(task_info)
         end
     end)
+end
+
+local function setup_notify_backend(opts)
+    local ok, err = notifier.setup(opts or {})
+    if not ok then
+        vim.notify("Flyout: " .. tostring(err), vim.log.levels.ERROR)
+    end
 end
 
 local function watch_task_and_open_quickfix(task_id, parser)
     local timer = vim.uv.new_timer()
     if not timer then
-        vim.notify("Flyout: failed to create quickfix watcher", vim.log.levels.ERROR)
+        notifier.notify("Flyout: failed to create quickfix watcher", vim.log.levels.ERROR)
         return
     end
 
@@ -248,7 +287,7 @@ local function watch_task_and_open_quickfix(task_id, parser)
             local task_info, err = task.get(task_id)
             if not task_info then
                 stop_timer()
-                vim.notify("Flyout: " .. err, vim.log.levels.ERROR)
+                complete_quickfix_postprocess(task_id)
                 return
             end
 
@@ -257,7 +296,22 @@ local function watch_task_and_open_quickfix(task_id, parser)
             end
 
             stop_timer()
-            ui.open_task_quickfix(task_id, { parser = parser })
+            if not quickfix_postprocess[task_id] then
+                return
+            end
+            quickfix_postprocess[task_id].parsing = true
+
+            if task_info.status == "stopped" or task_info.status == "killed" then
+                complete_quickfix_postprocess(task_id)
+                return
+            end
+
+            ui.open_task_quickfix(task_id, {
+                parser = parser,
+                on_done = function()
+                    complete_quickfix_postprocess(task_id)
+                end,
+            })
         end)
     end)
 end
@@ -274,12 +328,12 @@ local function setup_generated_quickfix_commands(opts)
     for _, parser in ipairs(parsers) do
         local cmd_name = prefix .. parser
         if vim.fn.exists(":" .. cmd_name) == 2 then
-            vim.notify(string.format("Flyout: command :%s already exists, skipping", cmd_name), vim.log.levels.WARN)
+            notifier.notify(string.format("Flyout: command :%s already exists, skipping", cmd_name), vim.log.levels.WARN)
         else
             vim.api.nvim_create_user_command(cmd_name, function(copts)
                 local _, err = M.run_quickfix(parser, copts.args)
                 if err then
-                    vim.notify("Flyout: " .. err, vim.log.levels.ERROR)
+                    notifier.notify("Flyout: " .. err, vim.log.levels.ERROR)
                     return
                 end
             end, {
@@ -304,6 +358,8 @@ function M.setup(opts)
 
     task.setup(task_opts)
     ui.setup(opts.ui or {})
+
+    setup_notify_backend(opts.notifications or {})
 
     local quickfix_opts = vim.tbl_deep_extend("force", {}, quickfix_defaults, opts.quickfix or {})
     ui.configure_quickfix(quickfix_opts)
@@ -365,6 +421,8 @@ function M.clear_finished(opts)
     for id, _ in pairs(before_ids) do
         if not after_ids[id] then
             stop_progress(id)
+            quickfix_postprocess[id] = nil
+            ui.release_task_resources(id)
         end
     end
 
@@ -375,6 +433,7 @@ function M.shutdown(opts)
     for id, _ in pairs(progress_state) do
         stop_progress(id)
     end
+    quickfix_postprocess = {}
     spinner_notifier.clear()
     return task.shutdown(opts)
 end
@@ -403,6 +462,22 @@ function M.open_task_quickfix(task_id, opts)
     return ui.open_task_quickfix(task_id, opts)
 end
 
+function M.delete(task_id, opts)
+    local deleted, err = task.delete(task_id, opts)
+    if not deleted then
+        return nil, err
+    end
+
+    local id = tonumber(task_id)
+    if id then
+        stop_progress(id)
+        quickfix_postprocess[id] = nil
+        ui.release_task_resources(id)
+    end
+
+    return deleted
+end
+
 function M.run_quickfix(parser, cmd)
     if type(cmd) ~= "string" or vim.trim(cmd) == "" then
         return nil, "command must be a non-empty string"
@@ -414,6 +489,11 @@ function M.run_quickfix(parser, cmd)
     end
 
     ui.set_task_quickfix_parser(started.id, parser)
+    quickfix_postprocess[started.id] = {
+        parser = parser,
+        task_info = started,
+        parsing = false,
+    }
     watch_task_and_open_quickfix(started.id, parser)
     return started
 end

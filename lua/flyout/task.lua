@@ -1,6 +1,7 @@
 local M = {}
 
 local uv = vim.uv
+local notifier = require("flyout.notifier")
 
 local tasks = {}
 local next_id = 1
@@ -548,7 +549,7 @@ local function start_ready_watcher(task)
 
             local chunk, chunk_err = read_output_chunk(current.output_path, current.ready_next_line or 1, 300)
             if not chunk then
-                vim.notify("Flyout: " .. tostring(chunk_err), vim.log.levels.ERROR)
+                notifier.notify("Flyout: " .. tostring(chunk_err), vim.log.levels.ERROR)
                 return
             end
 
@@ -938,6 +939,57 @@ function M.clear_finished(opts)
             tasks[task_id] = nil
         end
     end
+end
+
+function M.delete(task_id, delete_opts)
+    local task, err = get_task(task_id)
+    if not task then
+        return nil, err
+    end
+
+    local opts = vim.tbl_deep_extend("force", {}, M.opts or default_opts, delete_opts or {})
+
+    if is_active(task) then
+        local _, stop_err = M.stop(task_id, {
+            stop_timeout_ms = opts.stop_timeout_ms,
+        })
+        if stop_err then
+            return nil, stop_err
+        end
+
+        local wait_start = uv.now()
+        local wait_budget = (opts.stop_timeout_ms or default_opts.stop_timeout_ms) + 1500
+        while uv.now() - wait_start < wait_budget do
+            vim.wait(25)
+            local current = tasks[task_id]
+            if not current or not is_active(current) then
+                break
+            end
+        end
+
+        local current = tasks[task_id]
+        if current and is_active(current) then
+            send_signal(current, 9)
+            vim.wait(80)
+        end
+    end
+
+    local current = tasks[task_id]
+    if not current then
+        return {
+            id = task_id,
+        }
+    end
+
+    cleanup_task_runtime(current)
+    if current.output_path and uv.fs_stat(current.output_path) then
+        vim.fn.delete(current.output_path)
+    end
+    tasks[task_id] = nil
+
+    return {
+        id = task_id,
+    }
 end
 
 function M.on(event, callback)

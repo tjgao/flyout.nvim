@@ -60,6 +60,11 @@ require("flyout").setup({
         -- examples: 14, "40%"
         -- default is "40%"
         preview_height = "40%",
+
+        -- terminal scrollback for terminal log view
+        -- default is 200000
+        -- use -1 for a very large value
+        log_terminal_scrollback = 200000,
     },
     quickfix = {
         -- auto-generate parser commands like :Fgcc, :Fmsvc, :Frust
@@ -128,6 +133,12 @@ require("flyout").setup({
   - integer rows (for example `14`)
   - percent string (for example `"40%"`)
 - if list + preview cannot fit in the current screen, preview is hidden automatically
+
+### Log View
+
+- Full log windows (float/split/vsplit/tab) use terminal tailing (`tail -f`) for better large-log performance
+- Task preview in `:FlyoutTasks` also uses terminal tailing
+- `ui.log_terminal_scrollback` controls terminal log scrollback size
 
 ## Notes
 
