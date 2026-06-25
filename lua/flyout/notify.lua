@@ -14,17 +14,15 @@ local M = {}
 -- ─── Config ───────────────────────────────────────────────────────────────────
 
 local default_config = {
-    timeout = 3000,                  -- ms before auto-dismiss (false to disable)
-    max_height = 25,                 -- max body lines before "more ..." footer
+    timeout = 3000,        -- ms before auto-dismiss (false to disable)
+    vacant_timeout = 3000, -- ms vacant slot stays before collapsing
+    max_height = 25,       -- max body lines before "more ..." footer
     padding = { top = 0, right = 2, bottom = 0, left = 2 },
-    margin = { top = 1, right = 2 }, -- from top-right edge
-    gap = 1,                         -- vertical gap between stacked notifications
+    margin = { top = 1, right = 2 },
+    gap = 1, -- vertical gap between stacked notifications
+    -- Animation: set animate=false to disable, fps controls smoothness
     animate = true,
     fps = 60,
-    stages = {
-        enter = { { blend = 100 }, { blend = 60 }, { blend = 0 } },
-        exit = { { blend = 0 }, { blend = 60 }, { blend = 100 } },
-    },
     icons = {
         ERROR = "󰅚",
         WARN = "󰀪",
@@ -157,30 +155,29 @@ end
 
 -- ─── Layout ───────────────────────────────────────────────────────────────────
 
--- Active notifications (bottom of list = bottom of screen stack)
-local stack = {} -- list of handle objects, ordered bottom→top visually
+-- stack: handles + vacant placeholders { _vacant=true, _win_height, _win_width, id }
+local stack = {}
 local next_id = 0
 
 local function editor_size()
     return { width = vim.o.columns, height = vim.o.lines }
 end
 
--- Compute the row (top edge) for each slot in the stack.
--- Slot 1 = top-most (nearest screen top); stack grows downward.
+-- Logical position of each slot (ignores per-window slide offsets).
 local function layout_rows()
     local ed = editor_size()
     local rows = {}
     local y = config.margin.top
-    for i = 1, #stack do
-        local h = stack[i]
+    for i, h in ipairs(stack) do
         local win_w = h._win_width or 30
-        local col = ed.width - win_w - config.margin.right - 2 -- -2 for border
+        local col = ed.width - win_w - config.margin.right - 2
         rows[i] = { row = y, col = col }
         y = y + (h._win_height or 3) + config.gap
     end
     return rows
 end
 
+-- Reposition every open window to its logical slot.
 local function reflow()
     local rows = layout_rows()
     for i, h in ipairs(stack) do
@@ -188,11 +185,16 @@ local function reflow()
         if pos and h._winnr and api.nvim_win_is_valid(h._winnr) then
             api.nvim_win_set_config(h._winnr, {
                 relative = "editor",
-                row = pos.row + (h._y_offset or 0),
+                row = pos.row,
                 col = pos.col,
             })
         end
     end
+end
+
+-- Move a single window to an absolute (row, col), bypassing logical layout.
+local function win_move(winnr, row, col)
+    pcall(api.nvim_win_set_config, winnr, { relative = "editor", row = row, col = col })
 end
 
 -- ─── Animation ───────────────────────────────────────────────────────────────
@@ -200,72 +202,9 @@ end
 local function lerp(a, b, t)
     return a + (b - a) * t
 end
-
-local function animate_stages(handle, stages, on_done)
-    if not config.animate or #stages == 0 then
-        if on_done then
-            on_done()
-        end
-        return
-    end
-
-    local interval = math.floor(1000 / config.fps)
-    local stage_idx = 1
-    local step_count = 3 -- steps per stage
-    local step = 0
-    local timer = uv.new_timer()
-    if not timer then
-        if on_done then
-            on_done()
-        end
-        return
-    end
-    handle._anim_timer = timer
-
-    timer:start(
-        0,
-        interval,
-        vim.schedule_wrap(function()
-            if not handle._winnr or not api.nvim_win_is_valid(handle._winnr) then
-                timer:stop()
-                timer:close()
-                return
-            end
-
-            local stage = stages[stage_idx]
-            if not stage then
-                timer:stop()
-                timer:close()
-                if on_done then
-                    on_done()
-                end
-                return
-            end
-
-            step = step + 1
-            local t = step / step_count
-
-            -- blend
-            local target_blend = stage.blend or 0
-            local cur_blend = vim.api.nvim_get_option_value("winblend", { win = handle._winnr })
-            local new_blend = math.floor(lerp(cur_blend, target_blend, t))
-            pcall(vim.api.nvim_set_option_value, "winblend", math.max(0, math.min(100, new_blend)), {
-                win = handle._winnr,
-            })
-
-            -- y offset
-            if stage.dy then
-                handle._y_offset = (handle._y_offset or 0) + stage.dy * (1 / step_count)
-                reflow()
-            end
-
-            if step >= step_count then
-                step = 0
-                stage_idx = stage_idx + 1
-            end
-        end)
-    )
-end
+local function ease(t)
+    return t * t * (3 - 2 * t)
+end -- smoothstep
 
 local function stop_anim(handle)
     if handle._anim_timer then
@@ -277,20 +216,153 @@ local function stop_anim(handle)
     end
 end
 
+-- Animate a single window.
+-- keyframe fields: blend (0=opaque,100=invisible), col, row  (absolute editor coords)
+-- Missing fields are held at their current value.
+local function animate_to(handle, keyframes, on_done)
+    if not config.animate or #keyframes == 0 then
+        if on_done then
+            on_done()
+        end
+        return
+    end
+
+    stop_anim(handle)
+
+    local rows = layout_rows()
+    local slot_pos = nil
+    for i, h in ipairs(stack) do
+        if h.id == handle.id then
+            slot_pos = rows[i]
+            break
+        end
+    end
+    if not slot_pos then
+        if on_done then
+            on_done()
+        end
+        return
+    end
+
+    local interval = math.floor(1000 / config.fps)
+    local steps_per = math.max(1, math.floor(config.fps * 0.20)) -- 200ms per keyframe
+    local kf_idx = 1
+    local step = 0
+
+    local ok, cb = pcall(api.nvim_win_get_option, handle._winnr, "winblend")
+    local cur_blend = ok and cb or 0
+    local cur_col = slot_pos.col
+    local cur_row = slot_pos.row
+
+    -- Read actual window position as starting point
+    local winfo = api.nvim_win_get_config(handle._winnr)
+    if winfo and winfo.col then
+        cur_col = winfo.col
+    end
+    if winfo and winfo.row then
+        cur_row = winfo.row
+    end
+
+    local timer = uv.new_timer()
+    handle._anim_timer = timer
+
+    timer:start(
+        0,
+        interval,
+        vim.schedule_wrap(function()
+            if not handle._winnr or not api.nvim_win_is_valid(handle._winnr) then
+                timer:stop()
+                timer:close()
+                return
+            end
+            local kf = keyframes[kf_idx]
+            if not kf then
+                timer:stop()
+                timer:close()
+                if on_done then
+                    on_done()
+                end
+                return
+            end
+
+            step = step + 1
+            local t = ease(math.min(step / steps_per, 1))
+
+            local new_col = kf.col ~= nil and lerp(cur_col, kf.col, t) or nil
+            local new_row = kf.row ~= nil and lerp(cur_row, kf.row, t) or nil
+
+            if kf.blend ~= nil then
+                local b = math.floor(lerp(cur_blend, kf.blend, t))
+                pcall(api.nvim_win_set_option, handle._winnr, "winblend", math.max(0, math.min(100, b)))
+            end
+            if new_col ~= nil or new_row ~= nil then
+                win_move(handle._winnr, new_row ~= nil and new_row or cur_row, new_col ~= nil and new_col or cur_col)
+            end
+
+            if t >= 1 then
+                step = 0
+                kf_idx = kf_idx + 1
+                cur_blend = kf.blend ~= nil and kf.blend or cur_blend
+                cur_col = kf.col ~= nil and kf.col or cur_col
+                cur_row = kf.row ~= nil and kf.row or cur_row
+            end
+        end)
+    )
+end
+
+-- Animate windows from `from_idx` onward sliding from start_rows to target_rows.
+-- start_rows: layout_rows() snapshot WITH the vacant slot in stack
+-- target_rows: layout_rows() snapshot WITHOUT the vacant slot
+-- The vacant slot was at (from_idx - 1), so stack[from_idx] maps to target_rows[from_idx - 1].
+local function animate_collapse(from_idx, start_rows, target_rows)
+    local steps_per = math.max(1, math.floor(config.fps * 0.22))
+    local interval = math.floor(1000 / config.fps)
+    local step = 0
+
+    local timer = uv.new_timer()
+    timer:start(
+        0,
+        interval,
+        vim.schedule_wrap(function()
+            step = step + 1
+            local t = ease(math.min(step / steps_per, 1))
+
+            for i = from_idx, #stack do
+                local h = stack[i]
+                if h._winnr and api.nvim_win_is_valid(h._winnr) then
+                    local s = start_rows[i]      -- where it is now (vacant still counted)
+                    local e = target_rows[i - 1] -- where it should end up (vacant removed, index -1)
+                    if s and e then
+                        win_move(h._winnr, lerp(s.row, e.row, t), lerp(s.col, e.col, t))
+                    end
+                end
+            end
+
+            if t >= 1 then
+                timer:stop()
+                timer:close()
+                reflow()
+            end
+        end)
+    )
+end
+
 -- ─── Window / Buffer Construction ────────────────────────────────────────────
 
--- Truncate a string to fit within max_display_width cols, appending "…" if cut.
+-- Truncate a string to fit within max_cols display columns, appending "…" if cut.
+local ellipsis = "…"
+local ellipsis_w = vim.fn.strdisplaywidth(ellipsis)
 local function truncate(s, max_cols)
-    local w = vim.fn.strdisplaywidth(s)
-    if w <= max_cols then
+    if vim.fn.strdisplaywidth(s) <= max_cols then
         return s
     end
-    -- Binary-ish trim by chars until it fits with ellipsis
     local out = s
-    while vim.fn.strdisplaywidth(out .. "…") > max_cols and #out > 0 do
-        out = out:sub(1, -2)
+    -- trim one UTF-8 char at a time until (out + ellipsis) fits
+    while #out > 0 and vim.fn.strdisplaywidth(out) + ellipsis_w > max_cols do
+        -- step back one UTF-8 character (multi-byte safe)
+        out = out:gsub("[\128-\191]*.$", "")
     end
-    return out .. "…"
+    return out .. ellipsis
 end
 
 -- Compute adaptive inner content width (excludes padding and border).
@@ -430,17 +502,14 @@ function Handle:_open(msg, lvl_name, opts)
     -- buffer
     local bufnr = api.nvim_create_buf(false, true)
     api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
-    vim.api.nvim_set_option_value("modifiable", false, { buf = bufnr })
-    vim.api.nvim_set_option_value("filetype", "notify", { buf = bufnr })
+    api.nvim_buf_set_option(bufnr, "modifiable", false)
+    api.nvim_buf_set_option(bufnr, "filetype", "notify")
 
     -- apply highlights
     local ns = api.nvim_create_namespace("notify_hl_" .. self.id)
     for _, h in ipairs(hls) do
         local line, cs, ce, group = h[1], h[2], h[3], h[4]
-        pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line, cs, {
-            end_col = ce,
-            hl_group = group,
-        })
+        pcall(api.nvim_buf_add_highlight, bufnr, ns, group, line, cs, ce)
     end
 
     -- initial position (will be corrected by reflow)
@@ -461,25 +530,42 @@ function Handle:_open(msg, lvl_name, opts)
         noautocmd = true,
     })
 
-    vim.api.nvim_set_option_value(
+    api.nvim_win_set_option(
+        winnr,
         "winhl",
-        "Normal:NotifyBackground,FloatBorder:" .. (config.highlights[lvl_name] or config.highlights.INFO).border,
-        { win = winnr }
+        "Normal:NotifyBackground,FloatBorder:" .. (config.highlights[lvl_name] or config.highlights.INFO).border
     )
-    vim.api.nvim_set_option_value("winblend", config.animate and 100 or 0, { win = winnr })
-    vim.api.nvim_set_option_value("wrap", false, { win = winnr })
-    vim.api.nvim_set_option_value("cursorline", false, { win = winnr })
+    api.nvim_win_set_option(winnr, "winblend", config.animate and 100 or 0)
+    api.nvim_win_set_option(winnr, "wrap", false)
+    api.nvim_win_set_option(winnr, "cursorline", false)
 
     self._bufnr = bufnr
     self._winnr = winnr
-    self._y_offset = 0
     self._closed = false
 
-    -- slot already reserved in stack by M.notify; just reflow and animate
-    reflow()
+    -- Find this handle's logical position
+    local rows = layout_rows()
+    local slot_pos = nil
+    for i, h in ipairs(stack) do
+        if h.id == self.id then
+            slot_pos = rows[i]
+            break
+        end
+    end
+    local target_col = slot_pos and slot_pos.col or (ed.width - win_w - config.margin.right)
+    local target_row = slot_pos and slot_pos.row or config.margin.top
 
-    -- enter animation
-    animate_stages(self, config.stages.enter, nil)
+    if config.animate then
+        -- Move window to start position: off-screen to the right
+        win_move(winnr, target_row, ed.width)
+        api.nvim_win_set_option(winnr, "winblend", 0)
+        -- Animate col from off-screen right to logical position, with blend
+        animate_to(self, {
+            { col = target_col, row = target_row, blend = 0 },
+        }, nil)
+    else
+        win_move(winnr, target_row, target_col)
+    end
 
     -- auto-dismiss
     if opts.timeout ~= false then
@@ -503,7 +589,6 @@ function Handle:close()
     end
     self._closed = true
 
-    -- cancel auto-dismiss timer
     if self._timeout_timer then
         pcall(function()
             self._timeout_timer:stop()
@@ -511,30 +596,72 @@ function Handle:close()
         end)
         self._timeout_timer = nil
     end
+    if self._vacant_timer then
+        pcall(function()
+            self._vacant_timer:stop()
+            self._vacant_timer:close()
+        end)
+        self._vacant_timer = nil
+    end
 
     stop_anim(self)
 
-    local function do_close()
+    local function remove_and_collapse()
+        local slot_idx = nil
+        for i, h in ipairs(stack) do
+            if h.id == self.id then
+                slot_idx = i
+                break
+            end
+        end
+        if not slot_idx then
+            return
+        end
+
+        -- Snapshot positions WITH the vacant slot still in stack
+        local start_rows = layout_rows()
+
+        table.remove(stack, slot_idx)
+
+        -- Snapshot positions WITHOUT the vacant slot (final targets)
+        local target_rows = layout_rows()
+
+        if slot_idx <= #stack then
+            animate_collapse(slot_idx, start_rows, target_rows)
+        end
+    end
+
+    local function do_close_win()
         if self._winnr and api.nvim_win_is_valid(self._winnr) then
             api.nvim_win_close(self._winnr, true)
         end
         if self._bufnr and api.nvim_buf_is_valid(self._bufnr) then
             api.nvim_buf_delete(self._bufnr, { force = true })
         end
-        -- remove from stack
-        for i, h in ipairs(stack) do
-            if h.id == self.id then
-                table.remove(stack, i)
-                break
-            end
-        end
-        reflow()
+        self._winnr = nil
+        self._bufnr = nil
+
+        local vacant_timeout = config.vacant_timeout or 3000
+        self._vacant_timer = uv.new_timer()
+        self._vacant_timer:start(
+            vacant_timeout,
+            0,
+            vim.schedule_wrap(function()
+                remove_and_collapse()
+            end)
+        )
     end
 
-    if config.animate then
-        animate_stages(self, config.stages.exit, vim.schedule_wrap(do_close))
+    if config.animate and self._winnr and api.nvim_win_is_valid(self._winnr) then
+        local ed = editor_size()
+        local winfo = api.nvim_win_get_config(self._winnr)
+        local cur_col = winfo and winfo.col or ed.width
+        local cur_row = winfo and winfo.row or 0
+        animate_to(self, {
+            { col = ed.width, row = cur_row, blend = 0 },
+        }, vim.schedule_wrap(do_close_win))
     else
-        do_close()
+        do_close_win()
     end
 end
 
@@ -553,17 +680,14 @@ function Handle:update(msg, opts)
     local win_w = inner_w + config.padding.left + config.padding.right
     local lines, hls = build_content(msg, lvl_name, merged, inner_w)
 
-    vim.api.nvim_set_option_value("modifiable", true, { buf = self._bufnr })
+    api.nvim_buf_set_option(self._bufnr, "modifiable", true)
     api.nvim_buf_set_lines(self._bufnr, 0, -1, false, lines)
-    vim.api.nvim_set_option_value("modifiable", false, { buf = self._bufnr })
+    api.nvim_buf_set_option(self._bufnr, "modifiable", false)
 
     local ns = api.nvim_create_namespace("notify_hl_" .. self.id)
     api.nvim_buf_clear_namespace(self._bufnr, ns, 0, -1)
     for _, h in ipairs(hls) do
-        pcall(vim.api.nvim_buf_set_extmark, self._bufnr, ns, h[1], h[2], {
-            end_col = h[3],
-            hl_group = h[4],
-        })
+        pcall(api.nvim_buf_add_highlight, self._bufnr, ns, h[4], h[1], h[2], h[3])
     end
 
     local win_h = math.min(#lines, config.max_height + 3)
@@ -626,6 +750,7 @@ end
 ---Dismiss all active notifications
 function M.dismiss_all()
     -- copy because close() mutates stack
+    local all = vim.deepcopy(stack) -- shallow refs
     local handles = {}
     for _, h in ipairs(stack) do
         table.insert(handles, h)
@@ -637,11 +762,7 @@ end
 
 ---@param opts? table  override config
 function M.setup(opts)
-    opts = opts or {}
-    local override_vim_notify = opts.override_vim_notify ~= false
-    local merged = vim.deepcopy(opts)
-    merged.override_vim_notify = nil
-    config = vim.tbl_deep_extend("force", default_config, merged)
+    config = vim.tbl_deep_extend("force", default_config, opts or {})
     setup_highlights()
 
     -- Re-run highlights on colorscheme change
@@ -657,11 +778,8 @@ function M.setup(opts)
     })
 
     -- Override vim.notify
-    if override_vim_notify then
-        ---@diagnostic disable-next-line: duplicate-set-field
-        vim.notify = function(msg, level, nopts)
-            return M.notify(msg, level, nopts)
-        end
+    vim.notify = function(msg, level, nopts)
+        return M.notify(msg, level, nopts)
     end
 end
 

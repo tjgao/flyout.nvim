@@ -675,7 +675,6 @@ function M.start(cmd, start_opts)
     next_id = next_id + 1
 
     local output_path = new_output_path(task_id)
-
     local task = {
         id = task_id,
         cmd = cmd,
