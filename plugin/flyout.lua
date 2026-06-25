@@ -1,4 +1,5 @@
 local flyout = require("flyout")
+local shell_completion_enabled = vim.fn.has("wsl") ~= 1
 
 local function parse_task_id(value)
     if not value or value == "" then
@@ -25,7 +26,17 @@ local function complete_quickfix(arglead, cmdline)
         return out
     end
 
+    if not shell_completion_enabled then
+        return {}
+    end
     return vim.fn.getcompletion(arglead, "shellcmd")
+end
+
+local flyout_cmd_opts = {
+    nargs = "+",
+}
+if shell_completion_enabled then
+    flyout_cmd_opts.complete = "shellcmd"
 end
 
 vim.api.nvim_create_user_command("Flyout", function(opts)
@@ -34,10 +45,7 @@ vim.api.nvim_create_user_command("Flyout", function(opts)
         vim.notify("Flyout: " .. err, vim.log.levels.ERROR)
         return
     end
-end, {
-    nargs = "+",
-    complete = "shellcmd",
-})
+end, flyout_cmd_opts)
 
 vim.api.nvim_create_user_command("FlyoutStop", function(opts)
     local task_id, parse_err = parse_task_id(opts.args)

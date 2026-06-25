@@ -8,6 +8,7 @@ local notifier = require("flyout.notifier")
 local quickfix_defaults = {
     generate_commands = true,
     command_prefix = "F",
+    command_completion = "auto",
 }
 
 local notification_defaults = {
@@ -41,6 +42,20 @@ local function normalize_quickfix_prefix(prefix)
         return quickfix_defaults.command_prefix
     end
     return prefix
+end
+
+local function resolve_command_completion(value)
+    if value == "none" then
+        return nil
+    end
+    if value == "shellcmd" or value == "file" then
+        return value
+    end
+
+    if vim.fn.has("wsl") == 1 then
+        return nil
+    end
+    return "shellcmd"
 end
 
 local function clear_generated_quickfix_commands()
@@ -324,22 +339,26 @@ local function setup_generated_quickfix_commands(opts)
     end
 
     local prefix = normalize_quickfix_prefix(opts.command_prefix)
+    local completion = resolve_command_completion(opts.command_completion)
     local parsers = ui.quickfix_parsers()
     for _, parser in ipairs(parsers) do
         local cmd_name = prefix .. parser
         if vim.fn.exists(":" .. cmd_name) == 2 then
             notifier.notify(string.format("Flyout: command :%s already exists, skipping", cmd_name), vim.log.levels.WARN)
         else
+            local cmd_opts = {
+                nargs = "+",
+            }
+            if completion then
+                cmd_opts.complete = completion
+            end
             vim.api.nvim_create_user_command(cmd_name, function(copts)
                 local _, err = M.run_quickfix(parser, copts.args)
                 if err then
                     notifier.notify("Flyout: " .. err, vim.log.levels.ERROR)
                     return
                 end
-            end, {
-                nargs = "+",
-                complete = "shellcmd",
-            })
+            end, cmd_opts)
             table.insert(generated_quickfix_commands, cmd_name)
         end
     end

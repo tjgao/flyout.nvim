@@ -46,8 +46,22 @@ function M.notify(msg, level, opts)
 end
 
 function M.close(handle)
-    if handle and type(handle) == "table" and type(handle.close) == "function" then
+    if not handle or type(handle) ~= "table" then
+        return
+    end
+
+    if type(handle.close) == "function" then
         pcall(handle.close, handle)
+        return
+    end
+
+    if type(handle.hide) == "function" then
+        pcall(handle.hide, handle)
+        return
+    end
+
+    if type(handle.dismiss) == "function" then
+        pcall(handle.dismiss, handle)
     end
 end
 
