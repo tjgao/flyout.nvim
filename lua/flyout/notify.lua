@@ -26,11 +26,11 @@ local default_config = {
         exit = { { blend = 0 }, { blend = 60 }, { blend = 100 } },
     },
     icons = {
-        ERROR = "󰅚 ",
-        WARN = "󰀪 ",
-        INFO = "󰋼 ",
+        ERROR = "󰅚",
+        WARN = "󰀪",
+        INFO = "󰋼",
         DEBUG = "",
-        TRACE = "󰅩 ",
+        TRACE = "󰅩",
     },
     highlights = {
         ERROR = {
