@@ -768,6 +768,80 @@ local function with_selected_task(action)
     render_task_list()
 end
 
+local function select_task_quickfix_parser(task_id, always_pick, callback)
+    local id = tonumber(task_id)
+    if not id then
+        return
+    end
+
+    local current = task_quickfix_parser[id]
+    if not always_pick and type(current) == "string" and current ~= "" then
+        callback(current, false)
+        return
+    end
+
+    local parsers = M.quickfix_parsers()
+    local items = {
+        {
+            id = "none",
+            label = "none (disable)",
+        },
+    }
+
+    for _, name in ipairs(parsers) do
+        table.insert(items, {
+            id = name,
+            label = name,
+        })
+    end
+
+    vim.ui.select(items, {
+        prompt = string.format("Flyout quickfix parser for #%d", id),
+        kind = "list",
+        snacks = {
+            focus = "list",
+        },
+        format_item = function(item)
+            return item.label
+        end,
+    }, function(choice)
+        if not choice then
+            return
+        end
+
+        if choice.id == "none" then
+            task_quickfix_parser[id] = nil
+            notifier.notify(string.format("Flyout: disabled quickfix parser for task #%d", id), vim.log.levels.INFO, {
+                timeout = 1500,
+                hide_from_history = true,
+            })
+            callback(nil, true)
+            return
+        end
+
+        task_quickfix_parser[id] = choice.id
+        callback(choice.id, false)
+    end)
+end
+
+local function run_task_quickfix_from_list(always_pick)
+    local task_id = current_task_id_from_list()
+    if not task_id then
+        notifier.notify("Flyout: no task selected", vim.log.levels.WARN)
+        return
+    end
+
+    select_task_quickfix_parser(task_id, always_pick, function(parser, disabled)
+        render_task_list()
+        if disabled or not parser then
+            return
+        end
+        M.open_task_quickfix(task_id, {
+            parser = parser,
+        })
+    end)
+end
+
 local function open_task_list_help()
     local lines = {
         "Flyout Task List Help",
@@ -776,7 +850,8 @@ local function open_task_list_help()
         "S      Open log split",
         "V      Open log vsplit",
         "T      Open log tab",
-        "x      Parse quickfix",
+        "x      Parse quickfix (pick if unset)",
+        "X      Change quickfix parser",
         "s      Stop task",
         "r      Rerun task",
         "dd     Delete task",
@@ -857,7 +932,7 @@ local function stop_quickfix_parse_ui(task_id)
         state.timer:close()
     end
 
-    if state.handle and type(state.handle) == "table" and type(state.handle.close) == "function" then
+    if state.handle and type(state.handle) == "table" then
         notifier.close(state.handle)
     end
 end
@@ -1220,7 +1295,6 @@ function M.open_task_quickfix(task_id, opts)
         local id = tonumber(task_id)
         if id and quickfix_parse_state[id] then
             finish_quickfix_parse(id, payload)
-            return
         end
         if on_done then
             pcall(on_done, payload or {})
@@ -1338,7 +1412,11 @@ function M.open_task_quickfix(task_id, opts)
                 return
             end
 
+            local origin_win = vim.api.nvim_get_current_win()
             vim.cmd("copen")
+            if origin_win and vim.api.nvim_win_is_valid(origin_win) then
+                vim.api.nvim_set_current_win(origin_win)
+            end
             finish({ ok = true, count = size })
         end)
     end)
@@ -1355,6 +1433,14 @@ function M.set_task_quickfix_parser(task_id, parser)
     else
         task_quickfix_parser[id] = nil
     end
+end
+
+function M.get_task_quickfix_parser(task_id)
+    local id = tonumber(task_id)
+    if not id then
+        return nil
+    end
+    return task_quickfix_parser[id]
 end
 
 function M.release_task_resources(task_id)
@@ -1522,7 +1608,10 @@ function M.open_task_list()
         end)
     end, { buffer = buf, silent = true })
     vim.keymap.set("n", "x", function()
-        with_selected_task(M.open_task_quickfix)
+        run_task_quickfix_from_list(false)
+    end, { buffer = buf, silent = true })
+    vim.keymap.set("n", "X", function()
+        run_task_quickfix_from_list(true)
     end, { buffer = buf, silent = true })
 
     vim.api.nvim_create_autocmd("BufWipeout", {

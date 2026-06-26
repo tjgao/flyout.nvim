@@ -26,10 +26,6 @@ local event_listener_ids = {}
 local progress_state = {}
 local quickfix_postprocess = {}
 
-local function is_active_status(status)
-    return status == "pending" or status == "running" or status == "stopping"
-end
-
 local function is_progress_active_status(status)
     return status == "pending" or status == "running"
 end
@@ -242,6 +238,15 @@ local function setup_notifications(opts)
             notifier.notify(string.format("Flyout: started task #%d", task_info.id))
         end
         start_progress(task_info, notify_cfg)
+
+        local parser = ui.get_task_quickfix_parser(task_info.id)
+        if type(parser) == "string" and parser ~= "" and not quickfix_postprocess[task_info.id] then
+            quickfix_postprocess[task_info.id] = {
+                parser = parser,
+                task_info = task_info,
+                parsing = false,
+            }
+        end
     end)
 
     add_listener("ready", function(payload)
@@ -265,7 +270,16 @@ local function setup_notifications(opts)
             pending.notify_cfg = notify_cfg
             if task_info.status == "stopped" or task_info.status == "killed" then
                 complete_quickfix_postprocess(task_info.id)
+                return
             end
+
+            pending.parsing = true
+            ui.open_task_quickfix(task_info.id, {
+                parser = pending.parser,
+                on_done = function()
+                    complete_quickfix_postprocess(task_info.id)
+                end,
+            })
             return
         end
 
@@ -281,54 +295,6 @@ local function setup_notify_backend(opts)
     if not ok then
         vim.notify("Flyout: " .. tostring(err), vim.log.levels.ERROR)
     end
-end
-
-local function watch_task_and_open_quickfix(task_id, parser)
-    local timer = vim.uv.new_timer()
-    if not timer then
-        notifier.notify("Flyout: failed to create quickfix watcher", vim.log.levels.ERROR)
-        return
-    end
-
-    local function stop_timer()
-        if timer and not timer:is_closing() then
-            timer:stop()
-            timer:close()
-        end
-    end
-
-    timer:start(0, 500, function()
-        vim.schedule(function()
-            local task_info, err = task.get(task_id)
-            if not task_info then
-                stop_timer()
-                complete_quickfix_postprocess(task_id)
-                return
-            end
-
-            if is_active_status(task_info.status) then
-                return
-            end
-
-            stop_timer()
-            if not quickfix_postprocess[task_id] then
-                return
-            end
-            quickfix_postprocess[task_id].parsing = true
-
-            if task_info.status == "stopped" or task_info.status == "killed" then
-                complete_quickfix_postprocess(task_id)
-                return
-            end
-
-            ui.open_task_quickfix(task_id, {
-                parser = parser,
-                on_done = function()
-                    complete_quickfix_postprocess(task_id)
-                end,
-            })
-        end)
-    end)
 end
 
 local function setup_generated_quickfix_commands(opts)
@@ -513,7 +479,6 @@ function M.run_quickfix(parser, cmd)
         task_info = started,
         parsing = false,
     }
-    watch_task_and_open_quickfix(started.id, parser)
     return started
 end
 
