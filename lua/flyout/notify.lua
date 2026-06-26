@@ -15,7 +15,7 @@ local M = {}
 
 local default_config = {
     timeout = 3000,        -- ms before auto-dismiss (false to disable)
-    vacant_timeout = 3000, -- ms vacant slot stays before collapsing
+    vacant_timeout = 2000, -- ms vacant slot stays before collapsing
     max_height = 25,       -- max body lines before "more ..." footer
     padding = { top = 0, right = 2, bottom = 0, left = 2 },
     margin = { top = 1, right = 2 },
@@ -27,6 +27,13 @@ local default_config = {
         enter_ms = 220,
         exit_ms = 180,
         collapse_ms = 220,
+        -- Effects can be string ("fade+slide"), list ({"fade", "slide"}), or false/"none".
+        -- Supported: fade, slide, reveal
+        enter = { "slide", "reveal" },
+        exit = { "slide", "reveal" },
+        -- Optional tuning knobs for slide/reveal
+        slide_cols = nil, -- auto if nil
+        edge_cols = nil,  -- auto if nil
     },
     icons = {
         ERROR = "󰅚",
@@ -123,7 +130,7 @@ local level_fallbacks = {
 }
 
 local function setup_highlights()
-    local bg = resolve_bg({ "NormalFloat", "Normal" }, 0x1e1e2e)
+    local bg = resolve_bg({ "Normal", "NormalFloat" }, 0x1e1e2e)
     local fg_body = resolve_fg({ "NormalFloat", "Normal" }, 0xcdd6f4)
     local fg_dim = resolve_fg({ "Comment" }, 0x6c7086)
 
@@ -210,8 +217,78 @@ local function win_move(winnr, row, col)
 end
 
 local function slide_edge_cols(win_w)
+    local animation = config.animation
+    if type(animation) == "table" then
+        local edge = tonumber(animation.edge_cols)
+        if edge and edge >= 2 then
+            return math.floor(edge)
+        end
+    end
     local w = tonumber(win_w) or 30
     return math.max(2, math.floor(w * 0.12))
+end
+
+local function slide_distance_cols(win_w)
+    local animation = config.animation
+    if type(animation) == "table" then
+        local slide = tonumber(animation.slide_cols)
+        if slide and slide > 0 then
+            return math.floor(slide)
+        end
+    end
+    local w = tonumber(win_w) or 30
+    return math.max(4, math.floor(w * 0.2))
+end
+
+local function effect_set(values)
+    local set = {}
+    if type(values) == "string" then
+        local text = values:lower()
+        if text == "none" then
+            return set
+        end
+        for token in text:gmatch("[^+,%s|]+") do
+            set[token] = true
+        end
+        return set
+    end
+    if type(values) == "table" then
+        for _, value in ipairs(values) do
+            if type(value) == "string" then
+                set[value:lower()] = true
+            end
+        end
+    end
+    return set
+end
+
+local function animation_effects(name, fallback)
+    local animation = config.animation
+    if type(animation) ~= "table" then
+        return fallback
+    end
+    local raw = animation[name]
+    if raw == nil then
+        return fallback
+    end
+    if type(raw) == "string" and raw:lower() == "none" then
+        return {}
+    end
+    if raw == false then
+        return {}
+    end
+    if type(raw) == "table" and next(raw) == nil then
+        return {}
+    end
+    local set = effect_set(raw)
+    if next(set) == nil then
+        return fallback
+    end
+    return set
+end
+
+local function has_effect(effects, name)
+    return effects and effects[name] == true
 end
 
 -- ─── Animation ───────────────────────────────────────────────────────────────
@@ -420,6 +497,7 @@ local function animate_collapse()
             local sr = cfg and cfg.row or t.row
             local sc = cfg and cfg.col or t.col
             if sr ~= t.row or sc ~= t.col then
+                h._animating = true
                 moving[#moving + 1] = {
                     handle = h,
                     start_row = sr,
@@ -428,7 +506,6 @@ local function animate_collapse()
                     target_col = t.col,
                 }
             end
-            h._animating = true
         end
     end
 
@@ -679,12 +756,22 @@ function Handle:_open(msg, lvl_name, opts)
     local target_row = slot_pos and slot_pos.row or config.margin.top
 
     if config.animate then
-        local edge = slide_edge_cols(win_w)
-        local start_width = math.max(2, edge)
-        local right_edge = target_col + win_w
-        local start_col = right_edge - start_width
+        local effects = animation_effects("enter", { slide = true, reveal = true })
+        local use_fade = has_effect(effects, "fade")
+        local use_slide = has_effect(effects, "slide")
+        local use_reveal = has_effect(effects, "reveal")
 
-        -- Start as a thin sliver on the right edge, then reveal+slide to target.
+        local start_width = win_w
+        local start_col = target_col
+        if use_reveal then
+            local edge = slide_edge_cols(win_w)
+            start_width = math.max(2, edge)
+            start_col = target_col + (win_w - start_width)
+        end
+        if use_slide then
+            start_col = start_col + slide_distance_cols(win_w)
+        end
+
         pcall(api.nvim_win_set_config, winnr, {
             relative = "editor",
             row = math.floor(target_row),
@@ -692,11 +779,23 @@ function Handle:_open(msg, lvl_name, opts)
             width = start_width,
             height = win_h,
         })
-        api.nvim_win_set_option(winnr, "winblend", 0)
+        api.nvim_win_set_option(winnr, "winblend", use_fade and 100 or 0)
 
-        animate_to(self, {
-            { row = target_row, width = win_w, right_edge = right_edge, blend = 0 },
-        }, nil, animation_ms("enter_ms", 220))
+        if use_fade or use_slide or use_reveal then
+            local enter_keyframe = {
+                row = target_row,
+                col = target_col,
+            }
+            if use_reveal then
+                enter_keyframe.width = win_w
+            end
+            if use_fade then
+                enter_keyframe.blend = 0
+            end
+            animate_to(self, { enter_keyframe }, nil, animation_ms("enter_ms", 220))
+        else
+            win_move(winnr, target_row, target_col)
+        end
     else
         win_move(winnr, target_row, target_col)
     end
@@ -783,13 +882,38 @@ function Handle:close()
         local cur_col = winfo and winfo.col or ed.width
         local cur_row = winfo and winfo.row or 0
         local cur_width = winfo and winfo.width or self._win_width or 30
-        local edge = slide_edge_cols(self._win_width)
-        local edge_width = math.max(2, edge)
-        local right_edge = cur_col + cur_width
+        local effects = animation_effects("exit", { slide = true, reveal = true })
+        local use_fade = has_effect(effects, "fade")
+        local use_slide = has_effect(effects, "slide")
+        local use_reveal = has_effect(effects, "reveal")
 
-        animate_to(self, {
-            { row = cur_row, width = edge_width, right_edge = right_edge, blend = 0 },
-        }, vim.schedule_wrap(do_close_win), animation_ms("exit_ms", 180))
+        if use_fade or use_slide or use_reveal then
+            local target_col = cur_col
+            local target_width = cur_width
+            if use_reveal then
+                local edge = slide_edge_cols(cur_width)
+                target_width = math.max(2, edge)
+                target_col = target_col + (cur_width - target_width)
+            end
+            if use_slide then
+                target_col = target_col + slide_distance_cols(cur_width)
+            end
+
+            local exit_keyframe = {
+                row = cur_row,
+                col = target_col,
+            }
+            if use_reveal then
+                exit_keyframe.width = target_width
+            end
+            if use_fade then
+                exit_keyframe.blend = 100
+            end
+
+            animate_to(self, { exit_keyframe }, vim.schedule_wrap(do_close_win), animation_ms("exit_ms", 180))
+        else
+            do_close_win()
+        end
     else
         do_close_win()
     end
@@ -802,14 +926,6 @@ Handle.dismiss = Handle.close
 function Handle:update(msg, opts)
     opts = opts or {}
     if self._closed or not self._bufnr or not api.nvim_buf_is_valid(self._bufnr) then
-        return
-    end
-
-    if self._animating then
-        self._pending_update = {
-            msg = msg,
-            opts = opts,
-        }
         return
     end
 
@@ -830,6 +946,17 @@ function Handle:update(msg, opts)
     end
 
     local win_h = math.min(#lines, config.max_height + 3)
+    if self._animating then
+        -- Keep spinner/progress text flowing while animations run. Defer
+        -- geometry/reflow updates to animation completion to avoid fighting
+        -- window position/size keyframes.
+        self._pending_update = {
+            msg = msg,
+            opts = opts,
+        }
+        return
+    end
+
     self._win_width = win_w
     self._win_height = win_h + 2
     if self._winnr and api.nvim_win_is_valid(self._winnr) then
