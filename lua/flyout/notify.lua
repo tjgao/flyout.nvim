@@ -216,6 +216,37 @@ local function win_move(winnr, row, col)
     })
 end
 
+local function set_buf_option(bufnr, name, value)
+    pcall(api.nvim_set_option_value, name, value, { buf = bufnr })
+end
+
+local function set_win_option(winnr, name, value)
+    pcall(api.nvim_set_option_value, name, value, { win = winnr })
+end
+
+local function get_win_option(winnr, name, fallback)
+    local ok, value = pcall(api.nvim_get_option_value, name, { win = winnr })
+    if ok then
+        return value
+    end
+    return fallback
+end
+
+local function apply_highlights(bufnr, ns, hls)
+    api.nvim_buf_clear_namespace(bufnr, ns, 0, -1)
+    local lines = api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    for _, h in ipairs(hls) do
+        local line, cs, ce, group = h[1], h[2], h[3], h[4]
+        local text = lines[line + 1] or ""
+        local end_col = ce == -1 and #text or ce
+        pcall(api.nvim_buf_set_extmark, bufnr, ns, line, cs, {
+            end_row = line,
+            end_col = end_col,
+            hl_group = group,
+        })
+    end
+end
+
 local function slide_edge_cols(win_w)
     local animation = config.animation
     if type(animation) == "table" then
@@ -379,8 +410,7 @@ local function animate_to(handle, keyframes, on_done, duration_ms)
     local kf_idx = 1
     local step = 0
 
-    local ok, cb = pcall(api.nvim_win_get_option, handle._winnr, "winblend")
-    local cur_blend = ok and cb or 0
+    local cur_blend = tonumber(get_win_option(handle._winnr, "winblend", 0)) or 0
     local cur_col = slot_pos.col
     local cur_row = slot_pos.row
     local cur_width = handle._win_width or 30
@@ -402,6 +432,13 @@ local function animate_to(handle, keyframes, on_done, duration_ms)
     end
 
     local timer = uv.new_timer()
+    if not timer then
+        handle._animating = false
+        if on_done then
+            on_done()
+        end
+        return
+    end
     handle._anim_timer = timer
 
     timer:start(
@@ -410,15 +447,19 @@ local function animate_to(handle, keyframes, on_done, duration_ms)
         vim.schedule_wrap(function()
             if not handle._winnr or not api.nvim_win_is_valid(handle._winnr) then
                 handle._animating = false
-                timer:stop()
-                timer:close()
+                if timer and not timer:is_closing() then
+                    timer:stop()
+                    timer:close()
+                end
                 return
             end
             local kf = keyframes[kf_idx]
             if not kf then
                 handle._animating = false
-                timer:stop()
-                timer:close()
+                if timer and not timer:is_closing() then
+                    timer:stop()
+                    timer:close()
+                end
                 if handle._pending_update and not handle._closed then
                     local pending = handle._pending_update
                     handle._pending_update = nil
@@ -445,13 +486,15 @@ local function animate_to(handle, keyframes, on_done, duration_ms)
 
             if kf.blend ~= nil then
                 local b = math.floor(lerp(cur_blend, kf.blend, t))
-                pcall(api.nvim_win_set_option, handle._winnr, "winblend", math.max(0, math.min(100, b)))
+                set_win_option(handle._winnr, "winblend", math.max(0, math.min(100, b)))
             end
             if new_col ~= nil or new_row ~= nil or new_width ~= nil or new_height ~= nil then
+                local row = tonumber(new_row ~= nil and new_row or cur_row) or 0
+                local col = tonumber(new_col ~= nil and new_col or cur_col) or 0
                 local cfg = {
                     relative = "editor",
-                    row = math.floor(new_row ~= nil and new_row or cur_row),
-                    col = math.floor(new_col ~= nil and new_col or cur_col),
+                    row = math.floor(row),
+                    col = math.floor(col),
                 }
                 if new_width ~= nil then
                     cfg.width = math.max(2, math.floor(new_width))
@@ -520,6 +563,11 @@ local function animate_collapse()
     end
 
     local timer = uv.new_timer()
+    if not timer then
+        stop_collapse_animation()
+        reflow()
+        return
+    end
     collapse_state.timer = timer
     timer:start(
         0,
@@ -702,15 +750,12 @@ function Handle:_open(msg, lvl_name, opts)
     -- buffer
     local bufnr = api.nvim_create_buf(false, true)
     api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
-    api.nvim_buf_set_option(bufnr, "modifiable", false)
-    api.nvim_buf_set_option(bufnr, "filetype", "notify")
+    set_buf_option(bufnr, "modifiable", false)
+    set_buf_option(bufnr, "filetype", "notify")
 
     -- apply highlights
     local ns = api.nvim_create_namespace("notify_hl_" .. self.id)
-    for _, h in ipairs(hls) do
-        local line, cs, ce, group = h[1], h[2], h[3], h[4]
-        pcall(api.nvim_buf_add_highlight, bufnr, ns, group, line, cs, ce)
-    end
+    apply_highlights(bufnr, ns, hls)
 
     -- initial position (will be corrected by reflow)
     local ed = editor_size()
@@ -730,14 +775,14 @@ function Handle:_open(msg, lvl_name, opts)
         noautocmd = true,
     })
 
-    api.nvim_win_set_option(
+    set_win_option(
         winnr,
         "winhl",
         "Normal:NotifyBackground,FloatBorder:" .. (config.highlights[lvl_name] or config.highlights.INFO).border
     )
-    api.nvim_win_set_option(winnr, "winblend", config.animate and 100 or 0)
-    api.nvim_win_set_option(winnr, "wrap", false)
-    api.nvim_win_set_option(winnr, "cursorline", false)
+    set_win_option(winnr, "winblend", config.animate and 100 or 0)
+    set_win_option(winnr, "wrap", false)
+    set_win_option(winnr, "cursorline", false)
 
     self._bufnr = bufnr
     self._winnr = winnr
@@ -779,7 +824,7 @@ function Handle:_open(msg, lvl_name, opts)
             width = start_width,
             height = win_h,
         })
-        api.nvim_win_set_option(winnr, "winblend", use_fade and 100 or 0)
+        set_win_option(winnr, "winblend", use_fade and 100 or 0)
 
         if use_fade or use_slide or use_reveal then
             local enter_keyframe = {
@@ -805,13 +850,15 @@ function Handle:_open(msg, lvl_name, opts)
         local timeout = opts.timeout or config.timeout
         if timeout and timeout > 0 then
             self._timeout_timer = uv.new_timer()
-            self._timeout_timer:start(
-                timeout,
-                0,
-                vim.schedule_wrap(function()
-                    self:close()
-                end)
-            )
+            if self._timeout_timer then
+                self._timeout_timer:start(
+                    timeout,
+                    0,
+                    vim.schedule_wrap(function()
+                        self:close()
+                    end)
+                )
+            end
         end
     end
 end
@@ -867,13 +914,17 @@ function Handle:close()
 
         local vacant_timeout = config.vacant_timeout or 3000
         self._vacant_timer = uv.new_timer()
-        self._vacant_timer:start(
-            vacant_timeout,
-            0,
-            vim.schedule_wrap(function()
-                remove_and_collapse()
-            end)
-        )
+        if self._vacant_timer then
+            self._vacant_timer:start(
+                vacant_timeout,
+                0,
+                vim.schedule_wrap(function()
+                    remove_and_collapse()
+                end)
+            )
+        else
+            remove_and_collapse()
+        end
     end
 
     if config.animate and self._winnr and api.nvim_win_is_valid(self._winnr) then
@@ -935,15 +986,12 @@ function Handle:update(msg, opts)
     local win_w = inner_w + config.padding.left + config.padding.right
     local lines, hls = build_content(msg, lvl_name, merged, inner_w)
 
-    api.nvim_buf_set_option(self._bufnr, "modifiable", true)
+    set_buf_option(self._bufnr, "modifiable", true)
     api.nvim_buf_set_lines(self._bufnr, 0, -1, false, lines)
-    api.nvim_buf_set_option(self._bufnr, "modifiable", false)
+    set_buf_option(self._bufnr, "modifiable", false)
 
     local ns = api.nvim_create_namespace("notify_hl_" .. self.id)
-    api.nvim_buf_clear_namespace(self._bufnr, ns, 0, -1)
-    for _, h in ipairs(hls) do
-        pcall(api.nvim_buf_add_highlight, self._bufnr, ns, h[4], h[1], h[2], h[3])
-    end
+    apply_highlights(self._bufnr, ns, hls)
 
     local win_h = math.min(#lines, config.max_height + 3)
     if self._animating then
@@ -1015,8 +1063,7 @@ end
 
 ---Dismiss all active notifications
 function M.dismiss_all()
-    -- copy because close() mutates stack
-    local all = vim.deepcopy(stack) -- shallow refs
+    -- Copy handles first because close() mutates stack.
     local handles = {}
     for _, h in ipairs(stack) do
         table.insert(handles, h)
@@ -1044,6 +1091,7 @@ function M.setup(opts)
     })
 
     -- Override vim.notify
+    ---@diagnostic disable-next-line: duplicate-set-field
     vim.notify = function(msg, level, nopts)
         return M.notify(msg, level, nopts)
     end

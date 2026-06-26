@@ -183,7 +183,7 @@ local function start_progress(task_info, notify_cfg)
                 return
             end
 
-            local current, err = task.get(task_info.id)
+            local current = task.get(task_info.id)
             if not current then
                 stop_progress(task_info.id)
                 quickfix_postprocess[task_info.id] = nil
@@ -310,7 +310,10 @@ local function setup_generated_quickfix_commands(opts)
     for _, parser in ipairs(parsers) do
         local cmd_name = prefix .. parser
         if vim.fn.exists(":" .. cmd_name) == 2 then
-            notifier.notify(string.format("Flyout: command :%s already exists, skipping", cmd_name), vim.log.levels.WARN)
+            notifier.notify(
+                string.format("Flyout: command :%s already exists, skipping", cmd_name),
+                vim.log.levels.WARN
+            )
         else
             local cmd_opts = {
                 nargs = "+",

@@ -144,10 +144,6 @@ local function is_valid_errorformat(efm)
     })
 end
 
-local function is_active_status(status)
-    return status == "running" or status == "stopping"
-end
-
 local function make_float(title, width, height, footer)
     local columns = vim.o.columns
     local lines = vim.o.lines
@@ -239,7 +235,7 @@ local function resolve_task_list_height()
     return height
 end
 
-local function resolve_preview_height(list_height)
+local function resolve_preview_height()
     local fallback = "40%"
     local height = resolve_width(ui_opts.preview_height, vim.o.lines, fallback)
     height = math.max(6, math.floor(height))
@@ -276,15 +272,6 @@ end
 local function preview_pad_line(line)
     local content = line or ""
     local pad = string.rep(" ", preview_padding.x)
-    return pad .. content .. pad
-end
-
-local function pad_line_with_cols(line, cols)
-    local content = line or ""
-    if not cols or cols <= 0 then
-        return content
-    end
-    local pad = string.rep(" ", cols)
     return pad .. content .. pad
 end
 
@@ -601,7 +588,7 @@ local function ensure_task_list_preview_window()
     end
 
     local preview_width = list_width
-    local preview_height = resolve_preview_height(list_height)
+    local preview_height = resolve_preview_height()
     local preview_col = 0
     local preview_row = 0
 
@@ -1230,7 +1217,7 @@ local function open_log_in_split(task_id, kind)
     local win = vim.api.nvim_get_current_win()
     local buf = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_win_set_buf(win, buf)
-    attach_terminal_log_view(task_id, buf, win, { show_header = false })
+    attach_terminal_log_view(task_id, buf, win)
 
     if source_tab and vim.api.nvim_tabpage_is_valid(source_tab) then
         vim.api.nvim_set_current_tabpage(source_tab)
@@ -1258,7 +1245,6 @@ function M.open_task_log(task_id)
     log_float_wins[task_id] = win
     vim.wo[win].scrolloff = 0
     attach_terminal_log_view(task_id, buf, win, {
-        show_header = true,
         allow_task_actions = false,
         allow_open_targets = true,
     })
@@ -1514,7 +1500,7 @@ end
 function M.open_task_list()
     local required_list_width = task_list_required_width()
     local list_height = resolve_task_list_height()
-    local preview_height = resolve_preview_height(list_height)
+    local preview_height = resolve_preview_height()
     list_min_width =
         math.max(required_list_width, resolve_width(ui_opts.task_list_width, vim.o.columns, required_list_width))
 
