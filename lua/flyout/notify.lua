@@ -23,6 +23,11 @@ local default_config = {
     -- Animation: set animate=false to disable, fps controls smoothness
     animate = true,
     fps = 60,
+    animation = {
+        enter_ms = 220,
+        exit_ms = 180,
+        collapse_ms = 220,
+    },
     icons = {
         ERROR = "󰅚",
         WARN = "󰀪",
@@ -229,10 +234,39 @@ local function stop_anim(handle)
     handle._animating = false
 end
 
+local collapse_state = {
+    timer = nil,
+    moving = {},
+}
+
+local function stop_collapse_animation()
+    if collapse_state.timer and not collapse_state.timer:is_closing() then
+        collapse_state.timer:stop()
+        collapse_state.timer:close()
+    end
+    collapse_state.timer = nil
+    for _, h in ipairs(collapse_state.moving) do
+        h._animating = false
+    end
+    collapse_state.moving = {}
+end
+
+local function animation_ms(name, fallback)
+    local animation = config.animation
+    if type(animation) ~= "table" then
+        return fallback
+    end
+    local value = tonumber(animation[name])
+    if not value or value <= 0 then
+        return fallback
+    end
+    return math.floor(value)
+end
+
 -- Animate a single window.
 -- keyframe fields: blend (0=opaque,100=invisible), col, row  (absolute editor coords)
 -- Missing fields are held at their current value.
-local function animate_to(handle, keyframes, on_done)
+local function animate_to(handle, keyframes, on_done, duration_ms)
     if not config.animate or #keyframes == 0 then
         if on_done then
             on_done()
@@ -260,7 +294,11 @@ local function animate_to(handle, keyframes, on_done)
     end
 
     local interval = math.floor(1000 / config.fps)
-    local steps_per = math.max(1, math.floor(config.fps * 0.20)) -- 200ms per keyframe
+    local ms = tonumber(duration_ms) or 200
+    if ms <= 0 then
+        ms = 200
+    end
+    local steps_per = math.max(1, math.floor((config.fps * ms) / 1000))
     local kf_idx = 1
     local step = 0
 
@@ -304,6 +342,11 @@ local function animate_to(handle, keyframes, on_done)
                 handle._animating = false
                 timer:stop()
                 timer:close()
+                if handle._pending_update and not handle._closed then
+                    local pending = handle._pending_update
+                    handle._pending_update = nil
+                    handle:update(pending.msg, pending.opts)
+                end
                 if on_done then
                     on_done()
                 end
@@ -358,15 +401,49 @@ local function animate_to(handle, keyframes, on_done)
     )
 end
 
--- Animate windows from `from_idx` onward sliding from start_rows to target_rows.
--- start_rows: layout snapshot before removing a slot
--- target_rows: layout snapshot after removing that slot
-local function animate_collapse(from_idx, start_rows, target_rows)
-    local steps_per = math.max(1, math.floor(config.fps * 0.22))
+-- Animate all currently visible windows to their latest layout targets.
+local function animate_collapse()
+    stop_collapse_animation()
+
+    local ms = animation_ms("collapse_ms", 220)
+    local steps_per = math.max(1, math.floor((config.fps * ms) / 1000))
     local interval = math.floor(1000 / config.fps)
     local step = 0
 
+    local targets = layout_rows()
+    local moving = {}
+    for i = 1, #stack do
+        local h = stack[i]
+        local t = targets[i]
+        if h and t and h._winnr and api.nvim_win_is_valid(h._winnr) then
+            local cfg = api.nvim_win_get_config(h._winnr)
+            local sr = cfg and cfg.row or t.row
+            local sc = cfg and cfg.col or t.col
+            if sr ~= t.row or sc ~= t.col then
+                moving[#moving + 1] = {
+                    handle = h,
+                    start_row = sr,
+                    start_col = sc,
+                    target_row = t.row,
+                    target_col = t.col,
+                }
+            end
+            h._animating = true
+        end
+    end
+
+    if #moving == 0 then
+        reflow()
+        return
+    end
+
+    collapse_state.moving = {}
+    for _, item in ipairs(moving) do
+        table.insert(collapse_state.moving, item.handle)
+    end
+
     local timer = uv.new_timer()
+    collapse_state.timer = timer
     timer:start(
         0,
         interval,
@@ -374,20 +451,19 @@ local function animate_collapse(from_idx, start_rows, target_rows)
             step = step + 1
             local t = ease(math.min(step / steps_per, 1))
 
-            for i = from_idx, #stack do
-                local h = stack[i]
-                if h._winnr and api.nvim_win_is_valid(h._winnr) and not h._animating then
-                    local s = start_rows[i + 1] -- window i was at i+1 before removal
-                    local e = target_rows[i]    -- target slot after removal
-                    if s and e then
-                        win_move(h._winnr, lerp(s.row, e.row, t), lerp(s.col, e.col, t))
-                    end
+            for _, item in ipairs(moving) do
+                local h = item.handle
+                if h._winnr and api.nvim_win_is_valid(h._winnr) then
+                    win_move(
+                        h._winnr,
+                        lerp(item.start_row, item.target_row, t),
+                        lerp(item.start_col, item.target_col, t)
+                    )
                 end
             end
 
             if t >= 1 then
-                timer:stop()
-                timer:close()
+                stop_collapse_animation()
                 reflow()
             end
         end)
@@ -620,7 +696,7 @@ function Handle:_open(msg, lvl_name, opts)
 
         animate_to(self, {
             { row = target_row, width = win_w, right_edge = right_edge, blend = 0 },
-        }, nil)
+        }, nil, animation_ms("enter_ms", 220))
     else
         win_move(winnr, target_row, target_col)
     end
@@ -676,17 +752,8 @@ function Handle:close()
             return
         end
 
-        -- Snapshot positions WITH the vacant slot still in stack
-        local start_rows = layout_rows()
-
         table.remove(stack, slot_idx)
-
-        -- Snapshot positions WITHOUT the vacant slot (final targets)
-        local target_rows = layout_rows()
-
-        if slot_idx <= #stack then
-            animate_collapse(slot_idx, start_rows, target_rows)
-        end
+        animate_collapse()
     end
 
     local function do_close_win()
@@ -722,7 +789,7 @@ function Handle:close()
 
         animate_to(self, {
             { row = cur_row, width = edge_width, right_edge = right_edge, blend = 0 },
-        }, vim.schedule_wrap(do_close_win))
+        }, vim.schedule_wrap(do_close_win), animation_ms("exit_ms", 180))
     else
         do_close_win()
     end
@@ -737,6 +804,15 @@ function Handle:update(msg, opts)
     if self._closed or not self._bufnr or not api.nvim_buf_is_valid(self._bufnr) then
         return
     end
+
+    if self._animating then
+        self._pending_update = {
+            msg = msg,
+            opts = opts,
+        }
+        return
+    end
+
     local lvl_name = self._lvl_name
     local merged = vim.tbl_extend("force", self._opts, opts)
     local inner_w = compute_inner_width(msg, merged.title, lvl_name)
