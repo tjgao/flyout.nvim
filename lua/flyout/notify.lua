@@ -182,7 +182,7 @@ local function reflow()
     local rows = layout_rows()
     for i, h in ipairs(stack) do
         local pos = rows[i]
-        if pos and h._winnr and api.nvim_win_is_valid(h._winnr) then
+        if pos and h._winnr and api.nvim_win_is_valid(h._winnr) and not h._animating then
             api.nvim_win_set_config(h._winnr, {
                 relative = "editor",
                 row = pos.row,
@@ -194,7 +194,19 @@ end
 
 -- Move a single window to an absolute (row, col), bypassing logical layout.
 local function win_move(winnr, row, col)
-    pcall(api.nvim_win_set_config, winnr, { relative = "editor", row = row, col = col })
+    if row == nil or col == nil then
+        return
+    end
+    pcall(api.nvim_win_set_config, winnr, {
+        relative = "editor",
+        row = math.floor(tonumber(row) or 0),
+        col = math.floor(tonumber(col) or 0),
+    })
+end
+
+local function slide_edge_cols(win_w)
+    local w = tonumber(win_w) or 30
+    return math.max(2, math.floor(w * 0.12))
 end
 
 -- ─── Animation ───────────────────────────────────────────────────────────────
@@ -214,6 +226,7 @@ local function stop_anim(handle)
         end)
         handle._anim_timer = nil
     end
+    handle._animating = false
 end
 
 -- Animate a single window.
@@ -228,6 +241,7 @@ local function animate_to(handle, keyframes, on_done)
     end
 
     stop_anim(handle)
+    handle._animating = true
 
     local rows = layout_rows()
     local slot_pos = nil
@@ -238,6 +252,7 @@ local function animate_to(handle, keyframes, on_done)
         end
     end
     if not slot_pos then
+        handle._animating = false
         if on_done then
             on_done()
         end
@@ -253,6 +268,8 @@ local function animate_to(handle, keyframes, on_done)
     local cur_blend = ok and cb or 0
     local cur_col = slot_pos.col
     local cur_row = slot_pos.row
+    local cur_width = handle._win_width or 30
+    local cur_height = handle._win_height or 3
 
     -- Read actual window position as starting point
     local winfo = api.nvim_win_get_config(handle._winnr)
@@ -261,6 +278,12 @@ local function animate_to(handle, keyframes, on_done)
     end
     if winfo and winfo.row then
         cur_row = winfo.row
+    end
+    if winfo and winfo.width then
+        cur_width = winfo.width
+    end
+    if winfo and winfo.height then
+        cur_height = winfo.height
     end
 
     local timer = uv.new_timer()
@@ -271,12 +294,14 @@ local function animate_to(handle, keyframes, on_done)
         interval,
         vim.schedule_wrap(function()
             if not handle._winnr or not api.nvim_win_is_valid(handle._winnr) then
+                handle._animating = false
                 timer:stop()
                 timer:close()
                 return
             end
             local kf = keyframes[kf_idx]
             if not kf then
+                handle._animating = false
                 timer:stop()
                 timer:close()
                 if on_done then
@@ -290,13 +315,31 @@ local function animate_to(handle, keyframes, on_done)
 
             local new_col = kf.col ~= nil and lerp(cur_col, kf.col, t) or nil
             local new_row = kf.row ~= nil and lerp(cur_row, kf.row, t) or nil
+            local new_width = kf.width ~= nil and lerp(cur_width, kf.width, t) or nil
+            local new_height = kf.height ~= nil and lerp(cur_height, kf.height, t) or nil
+
+            if kf.right_edge ~= nil then
+                local width_for_col = new_width ~= nil and new_width or cur_width
+                new_col = kf.right_edge - width_for_col
+            end
 
             if kf.blend ~= nil then
                 local b = math.floor(lerp(cur_blend, kf.blend, t))
                 pcall(api.nvim_win_set_option, handle._winnr, "winblend", math.max(0, math.min(100, b)))
             end
-            if new_col ~= nil or new_row ~= nil then
-                win_move(handle._winnr, new_row ~= nil and new_row or cur_row, new_col ~= nil and new_col or cur_col)
+            if new_col ~= nil or new_row ~= nil or new_width ~= nil or new_height ~= nil then
+                local cfg = {
+                    relative = "editor",
+                    row = math.floor(new_row ~= nil and new_row or cur_row),
+                    col = math.floor(new_col ~= nil and new_col or cur_col),
+                }
+                if new_width ~= nil then
+                    cfg.width = math.max(2, math.floor(new_width))
+                end
+                if new_height ~= nil then
+                    cfg.height = math.max(1, math.floor(new_height))
+                end
+                pcall(api.nvim_win_set_config, handle._winnr, cfg)
             end
 
             if t >= 1 then
@@ -305,15 +348,19 @@ local function animate_to(handle, keyframes, on_done)
                 cur_blend = kf.blend ~= nil and kf.blend or cur_blend
                 cur_col = kf.col ~= nil and kf.col or cur_col
                 cur_row = kf.row ~= nil and kf.row or cur_row
+                cur_width = kf.width ~= nil and kf.width or cur_width
+                cur_height = kf.height ~= nil and kf.height or cur_height
+                if kf.right_edge ~= nil then
+                    cur_col = kf.right_edge - cur_width
+                end
             end
         end)
     )
 end
 
 -- Animate windows from `from_idx` onward sliding from start_rows to target_rows.
--- start_rows: layout_rows() snapshot WITH the vacant slot in stack
--- target_rows: layout_rows() snapshot WITHOUT the vacant slot
--- The vacant slot was at (from_idx - 1), so stack[from_idx] maps to target_rows[from_idx - 1].
+-- start_rows: layout snapshot before removing a slot
+-- target_rows: layout snapshot after removing that slot
 local function animate_collapse(from_idx, start_rows, target_rows)
     local steps_per = math.max(1, math.floor(config.fps * 0.22))
     local interval = math.floor(1000 / config.fps)
@@ -329,9 +376,9 @@ local function animate_collapse(from_idx, start_rows, target_rows)
 
             for i = from_idx, #stack do
                 local h = stack[i]
-                if h._winnr and api.nvim_win_is_valid(h._winnr) then
-                    local s = start_rows[i]      -- where it is now (vacant still counted)
-                    local e = target_rows[i - 1] -- where it should end up (vacant removed, index -1)
+                if h._winnr and api.nvim_win_is_valid(h._winnr) and not h._animating then
+                    local s = start_rows[i + 1] -- window i was at i+1 before removal
+                    local e = target_rows[i]    -- target slot after removal
                     if s and e then
                         win_move(h._winnr, lerp(s.row, e.row, t), lerp(s.col, e.col, t))
                     end
@@ -556,12 +603,23 @@ function Handle:_open(msg, lvl_name, opts)
     local target_row = slot_pos and slot_pos.row or config.margin.top
 
     if config.animate then
-        -- Move window to start position: off-screen to the right
-        win_move(winnr, target_row, ed.width)
+        local edge = slide_edge_cols(win_w)
+        local start_width = math.max(2, edge)
+        local right_edge = target_col + win_w
+        local start_col = right_edge - start_width
+
+        -- Start as a thin sliver on the right edge, then reveal+slide to target.
+        pcall(api.nvim_win_set_config, winnr, {
+            relative = "editor",
+            row = math.floor(target_row),
+            col = math.floor(start_col),
+            width = start_width,
+            height = win_h,
+        })
         api.nvim_win_set_option(winnr, "winblend", 0)
-        -- Animate col from off-screen right to logical position, with blend
+
         animate_to(self, {
-            { col = target_col, row = target_row, blend = 0 },
+            { row = target_row, width = win_w, right_edge = right_edge, blend = 0 },
         }, nil)
     else
         win_move(winnr, target_row, target_col)
@@ -657,8 +715,13 @@ function Handle:close()
         local winfo = api.nvim_win_get_config(self._winnr)
         local cur_col = winfo and winfo.col or ed.width
         local cur_row = winfo and winfo.row or 0
+        local cur_width = winfo and winfo.width or self._win_width or 30
+        local edge = slide_edge_cols(self._win_width)
+        local edge_width = math.max(2, edge)
+        local right_edge = cur_col + cur_width
+
         animate_to(self, {
-            { col = ed.width, row = cur_row, blend = 0 },
+            { row = cur_row, width = edge_width, right_edge = right_edge, blend = 0 },
         }, vim.schedule_wrap(do_close_win))
     else
         do_close_win()
