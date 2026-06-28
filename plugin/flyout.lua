@@ -85,6 +85,27 @@ end, {
     nargs = 0,
 })
 
+vim.api.nvim_create_user_command("FlyoutTemplates", function()
+    flyout.open_template_list()
+end, {
+    nargs = 0,
+})
+
+vim.api.nvim_create_user_command("FlyoutTemplate", function(opts)
+    local _, err = flyout.run_template(opts.args)
+    if err and err ~= "cancelled" then
+        vim.notify("Flyout: " .. err, vim.log.levels.ERROR)
+    end
+end, {
+    nargs = 1,
+})
+
+vim.api.nvim_create_user_command("FlyoutPick", function()
+    flyout.pick_template()
+end, {
+    nargs = 0,
+})
+
 vim.api.nvim_create_user_command("FlyoutLog", function(opts)
     local task_id, parse_err = parse_task_id(opts.args)
     if not task_id then

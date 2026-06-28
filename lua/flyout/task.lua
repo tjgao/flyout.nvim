@@ -362,6 +362,7 @@ local function public_task(task)
         ready = task.ready,
         ready_at = task.ready_at,
         notify = task.notify,
+        meta = task.meta,
     }
 end
 
@@ -615,6 +616,7 @@ local function start_task_timeout(task, opts)
 end
 
 local function launch_task(task, opts)
+    task.output_path = new_output_path(task.id)
     local shell_cmd = build_shell_command(task.cmd, task.output_path, opts)
     local task_id = task.id
 
@@ -693,6 +695,7 @@ function M.start(cmd, start_opts)
         run_opts = run_opts,
         ready_when = run_opts.ready_when,
         notify = run_opts.notify,
+        meta = start_opts and start_opts.meta or nil,
         ready = false,
         ready_at = nil,
         ready_match_count = 0,
@@ -766,13 +769,17 @@ function M.stop(task_id, stop_opts)
     return public_task(task)
 end
 
-function M.rerun(task_id)
+function M.rerun(task_id, rerun_opts)
     local task, err = get_task(task_id)
     if not task then
         return nil, err
     end
 
+    rerun_opts = rerun_opts or {}
     local cmd = task.cmd
+    if type(rerun_opts.cmd) == "string" and vim.trim(rerun_opts.cmd) ~= "" then
+        cmd = rerun_opts.cmd
+    end
     local active = is_active(task)
 
     if active then
@@ -799,13 +806,31 @@ function M.rerun(task_id)
     task.cmd = cmd
 
     local opts = M.opts or default_opts
-    local run_opts = task.run_opts or {
-        timeout_ms = opts.timeout_ms,
-        ready_when = nil,
+    local start_overrides = {
+        timeout_ms = rerun_opts.timeout_ms,
+        ready_when = rerun_opts.ready_when,
+        notify = rerun_opts.notify,
     }
+    if start_overrides.timeout_ms == nil and task.run_opts then
+        start_overrides.timeout_ms = task.run_opts.timeout_ms
+    end
+    if start_overrides.ready_when == nil and task.run_opts then
+        start_overrides.ready_when = task.run_opts.ready_when
+    end
+    if start_overrides.notify == nil and task.run_opts then
+        start_overrides.notify = task.run_opts.notify
+    end
+
+    local run_opts, run_opts_err = resolve_run_opts(opts, start_overrides)
+    if not run_opts then
+        return nil, run_opts_err
+    end
     task.run_opts = run_opts
     task.ready_when = run_opts.ready_when
     task.notify = run_opts.notify
+    if rerun_opts.meta ~= nil then
+        task.meta = rerun_opts.meta
+    end
     local restarted, restart_err = launch_task(task, opts)
     if not restarted then
         return nil, restart_err

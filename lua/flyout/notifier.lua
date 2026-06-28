@@ -68,34 +68,38 @@ local function create_custom_adapter(fn)
     }
 end
 
-local function create_flyout_adapter()
-    local ok, flyout_notify = pcall(require, "flyout.notify")
+local function create_fy_adapter(opts)
+    local ok, flyout_notify = pcall(require, "fy")
     if not ok then
-        return nil, "failed to load flyout.notify backend"
+        return nil, "failed to load fy.nvim backend"
     end
 
     if type(flyout_notify.setup) == "function" then
+        local override_vim_notify = false
+        if type(opts) == "table" and opts.override_vim_notify ~= nil then
+            override_vim_notify = opts.override_vim_notify == true
+        end
         flyout_notify.setup({
-            override_vim_notify = false,
+            override_vim_notify = override_vim_notify,
         })
     end
 
     if type(flyout_notify.notify) == "function" then
         return {
-            name = "flyout",
+            name = "fy",
             notify = flyout_notify.notify,
             module = flyout_notify,
         }
     end
     if type(flyout_notify) == "function" then
         return {
-            name = "flyout",
+            name = "fy",
             notify = flyout_notify,
             module = flyout_notify,
         }
     end
 
-    return nil, "invalid flyout.notify backend"
+    return nil, "invalid fy.nvim backend"
 end
 
 local function create_snacks_adapter()
@@ -179,7 +183,7 @@ local function create_mini_notify_adapter()
     then
         local prev_format = mini_notify.config.content.format
         mini_notify.config.content.format = function(notif)
-            if type(notif) == "table" and type(notif.data) == "table" and notif.data.source == "flyout" then
+            if type(notif) == "table" and type(notif.data) == "table" and notif.data.source == "fy" then
                 return tostring(notif.msg or "")
             end
             if type(prev_format) == "function" then
@@ -222,7 +226,7 @@ local function create_mini_notify_adapter()
             end
         end
 
-        local id = mini_notify.add(tostring(msg), level_name, nil, { source = "flyout" })
+        local id = mini_notify.add(tostring(msg), level_name, nil, { source = "fy" })
         local timeout = opts.timeout
         if timeout == true then
             timeout = 5000
@@ -264,7 +268,7 @@ local function resolve_backend(opts)
         if adapter then
             return adapter
         end
-        adapter = create_flyout_adapter()
+        adapter = create_fy_adapter(opts)
         if adapter then
             return adapter
         end
@@ -274,8 +278,8 @@ local function resolve_backend(opts)
     if backend == "vim" then
         return create_vim_adapter()
     end
-    if backend == "flyout" then
-        return create_flyout_adapter()
+    if backend == "flyout" or backend == "fy" then
+        return create_fy_adapter(opts)
     end
     if backend == "snacks" then
         local adapter = create_snacks_adapter()
@@ -348,7 +352,7 @@ function M.close(handle)
         return
     end
 
-    if handle.type == "flyout" then
+    if handle.type == "fy" then
         local h = handle.handle
         if type(h) == "table" then
             if type(h.close) == "function" then
