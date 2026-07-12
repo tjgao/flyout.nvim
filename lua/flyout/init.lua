@@ -114,6 +114,16 @@ local function task_notify_config(task_info)
     return normalize_notify_config(M.notification_opts or notification_defaults, override)
 end
 
+local function task_notify_label(task_info)
+    local id = tonumber(task_info and task_info.id) or 0
+    local meta = task_info and task_info.meta or nil
+    local name = meta and meta.template_name
+    if type(name) == "string" and name ~= "" then
+        return string.format("%s (#%d)", name, id)
+    end
+    return string.format("task #%d", id)
+end
+
 local function stop_progress(task_id)
     local state = progress_state[task_id]
     if not state then
@@ -130,14 +140,15 @@ local function stop_progress(task_id)
 end
 
 local function notify_task_end(task_info)
+    local label = task_notify_label(task_info)
     if task_info.status == "success" then
-        notifier.notify(string.format("Flyout: task #%d finished", task_info.id))
+        notifier.notify(string.format("Flyout: %s finished", label))
     elseif task_info.status == "timeout" then
-        notifier.notify(string.format("Flyout: task #%d timed out", task_info.id), vim.log.levels.WARN)
+        notifier.notify(string.format("Flyout: %s timed out", label), vim.log.levels.WARN)
     elseif task_info.status == "stopped" or task_info.status == "killed" then
-        notifier.notify(string.format("Flyout: task #%d stopped", task_info.id), vim.log.levels.WARN)
+        notifier.notify(string.format("Flyout: %s stopped", label), vim.log.levels.WARN)
     else
-        notifier.notify(string.format("Flyout: task #%d failed", task_info.id), vim.log.levels.ERROR)
+        notifier.notify(string.format("Flyout: %s failed", label), vim.log.levels.ERROR)
     end
 end
 
@@ -330,7 +341,7 @@ local function setup_notifications(opts)
         local task_info = payload.task
         local notify_cfg = task_notify_config(task_info)
         if notify_cfg.start then
-            notifier.notify(string.format("Flyout: started task #%d", task_info.id))
+            notifier.notify(string.format("Flyout: started %s", task_notify_label(task_info)))
         end
         start_progress(task_info, notify_cfg)
 

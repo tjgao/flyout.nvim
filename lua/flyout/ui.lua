@@ -1270,6 +1270,52 @@ save_template_safe = function(template)
     return template_store.save(next_templates)
 end
 
+local function rename_template_safe(old_name, template)
+    if type(old_name) ~= "string" or old_name == "" then
+        return save_template_safe(template)
+    end
+    if type(template) ~= "table" then
+        return nil, "template must be a table"
+    end
+    if type(template.name) ~= "string" or template.name == "" then
+        return nil, "template.name must be a non-empty string"
+    end
+    if template.name == old_name then
+        return save_template_safe(template)
+    end
+
+    local templates, err = list_templates_safe()
+    if not templates then
+        return nil, err
+    end
+
+    local old_template = nil
+    for _, item in ipairs(templates) do
+        if item.name == old_name then
+            old_template = vim.deepcopy(item)
+        elseif item.name == template.name then
+            return nil, string.format("duplicate template name '%s'", template.name)
+        end
+    end
+
+    if not old_template then
+        return save_template_safe(template)
+    end
+
+    local deleted, delete_err = delete_template_safe(old_name)
+    if not deleted then
+        return nil, delete_err
+    end
+
+    local saved, save_err = save_template_safe(template)
+    if saved then
+        return true
+    end
+
+    save_template_safe(old_template)
+    return nil, save_err
+end
+
 delete_template_safe = function(name)
     if type(template_actions.delete) == "function" then
         return template_actions.delete(name)
@@ -1703,7 +1749,10 @@ local function rerun_pipeline_from_task(task_id)
     return template_actions.run(pipeline_name)
 end
 
-local function open_template_editor(template)
+local function open_template_editor(template, editor_opts)
+    editor_opts = editor_opts or {}
+    local original_name = type(editor_opts.original_name) == "string" and editor_opts.original_name or nil
+    local existing_template = editor_opts.existing == true
     local source = vim.inspect(template, { newline = "\n", indent = "    " })
     local lines = vim.split(source, "\n", { plain = true })
     local initial_text = table.concat(lines, "\n")
@@ -1829,13 +1878,20 @@ local function open_template_editor(template)
             return
         end
 
-        local saved, err = save_template_safe(parsed)
+        local saved, err = nil, nil
+        if existing_template and original_name and parsed.name ~= original_name then
+            saved, err = rename_template_safe(original_name, parsed)
+        else
+            saved, err = save_template_safe(parsed)
+        end
         if not saved then
             notify_err(err)
             return
         end
 
         vim.bo[buf].modified = false
+        original_name = parsed.name
+        existing_template = true
         initial_text = text
         render_task_list()
         if close_after then
@@ -1941,7 +1997,10 @@ local function edit_selected_template()
 
     for _, template in ipairs(templates) do
         if template.name == name then
-            open_template_editor(template)
+            open_template_editor(template, {
+                original_name = name,
+                existing = true,
+            })
             return
         end
     end
