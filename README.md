@@ -1,38 +1,187 @@
 # flyout.nvim
 
-A lightweight background task launcher/manager for Neovim.
+Flyout is a task runner for Neovim focused on fast iteration loops:
 
-## Features
+- run shell commands asynchronously
+- define reusable task templates and pipelines
+- monitor status and logs in a focused UI
+- parse command output into quickfix
+- integrate with `nvim-dap` via `preLaunchTask`
 
-- Run shell commands asynchronously via `:Flyout ...`
-- Track task status in a task-list UI (`:FlyoutTasks`)
-- Stop and rerun tasks
-- Live output viewer (float/split/vsplit/tab)
-- Shared output polling for multiple viewers of the same task
+## When to Choose Flyout
+
+Choose Flyout if you want:
+
+- a focused task runner with minimal setup friction
+- project-local, versioned task definitions in `.flyout/templates.lua`
+- first-class pipeline controls directly in the task list UI
+- built-in parser-to-quickfix workflow for fast error navigation
+- `nvim-dap` `preLaunchTask` support without extra task adapters
+- a workflow optimized for solo or small-team repos
+
+If your priority is broad ecosystem integrations and highly extensible task orchestration, `overseer.nvim` may be a better fit.
+
+## Highlights
+
+- Single tasks and multi-step pipelines
+- Per-project templates file: `.flyout/templates.lua`
+- Template editor and picker UI (`:FlyoutTemplates`, `:FlyoutPick`)
+- Smart task lifecycle: stop, rerun, clear, singleton reuse
+- Pipeline-aware actions in UI (`s`, `r`, `dd`, `za`)
+- Built-in quickfix parser flow (`x`, `X`, `:FlyoutQuickfix`)
+- Optional notifier backends (`vim`, `fy`, `snacks`, `nvim-notify`, `mini.notify`, `auto`)
+- `nvim-dap` integration (`preLaunchTask`, including sequential task lists)
+
+## Installation
+
+### lazy.nvim
+
+```lua
+{
+    "tjgao/flyout.nvim",
+    dependencies = {
+        -- optional if you want notify_backend = "fy"
+        "tjgao/fy.nvim",
+    },
+    config = function()
+        require("flyout").setup()
+    end,
+}
+```
 
 ## Commands
 
-- `:Flyout {cmd}` - start a task
-- `:FlyoutStop {id}` - stop a task
-- `:FlyoutRerun {id}` - rerun a task (same task entry/log file)
-- `:FlyoutTasks` - open task list window
-- `:FlyoutLog {id}` - open floating log window for a task
-- `:FlyoutQuickfix {parser} {cmd}` - run command as Flyout task, parse output with parser, then auto-open quickfix on first parsed entry
+- `:Flyout {cmd}` - start an ad-hoc task
+- `:FlyoutStop {id}` - stop a running task
+- `:FlyoutRerun {id}` - rerun task in-place
+- `:FlyoutTasks` - open task list
+- `:FlyoutTemplates` - open templates mode directly
+- `:FlyoutTemplate {name}` - run template by name
+- `:FlyoutPick` - pick and run template/pipeline with `vim.ui.select`
+- `:FlyoutLog {id}` - open floating log for task
+- `:FlyoutQuickfix {parser} {cmd}` - run command and parse output to quickfix
+- `:FlyoutStopPrelaunch` - emergency stop for active DAP prelaunch runs
 
 ## Task List Keys
 
-- `<Enter>` open floating log for selected task
-- `S` open log in split
-- `V` open log in vsplit
-- `T` open log in tab
-- `s` stop selected task
-- `r` rerun selected task
-- `x` parse selected task log into quickfix
+- `Enter` open log float (or run selected template in templates mode)
+- `S` / `V` / `T` open log in split / vsplit / tab
+- `s` stop selected task (pipeline row stops the whole pipeline run)
+- `r` rerun selected task (pipeline row reruns whole pipeline)
+- `dd` delete selected task (pipeline row deletes whole pipeline run)
+- `x` parse task output into quickfix (pick parser if unset)
+- `X` change quickfix parser for selected task
+- `za` expand/collapse pipeline rows
+- `a` create a template from selected task
+- `A` add template
+- `C` copy template
+- `E` edit template
+- `gt` toggle tasks/templates mode
 - `c` clear finished tasks
 - `R` refresh list
-- `q` close task list
+- `?` open in-app help
+- `q` / `Esc` close task list
 
-## Setup
+## Templates and Pipelines
+
+Flyout stores templates in `.flyout/templates.lua` (project-local).
+
+Example:
+
+```lua
+return {
+    templates = {
+        {
+            type = "task",
+            name = "build",
+            cmd = "make",
+            parser = "gcc",
+            singleton = true,
+            hidden = false,
+            confirm = false,
+            timeout_ms = 0,
+            ready_when = "Build complete",
+            notify = {
+                start = true,
+                ["end"] = true,
+                progress = { enabled = false },
+            },
+        },
+        {
+            type = "task",
+            name = "test",
+            cmd = "make test",
+            parser = "gcc",
+            singleton = true,
+        },
+        {
+            type = "pipeline",
+            name = "build+test",
+            steps = { "build", "test" },
+            singleton = true,
+            hidden = false,
+            confirm = "Run build+test pipeline?",
+        },
+    },
+}
+```
+
+Template rules:
+
+- `type` is `"task"` or `"pipeline"`
+- task templates require `cmd`
+- pipeline templates require non-empty `steps` list
+- pipeline steps must reference existing task templates
+- `notification` is not valid; use `notify`
+
+## DAP preLaunchTask Integration
+
+Enable once during DAP setup:
+
+```lua
+require("flyout").setup()
+require("flyout").enable_dap()
+```
+
+Then use `preLaunchTask` in DAP launch configs:
+
+```lua
+{
+    type = "cppdbg",
+    request = "launch",
+    name = "Debug app",
+    program = "${workspaceFolder}/bin/app",
+    cwd = "${workspaceFolder}",
+    preLaunchTask = { "build", "test" },
+}
+```
+
+Behavior:
+
+- accepts `preLaunchTask = "name"` or list of names
+- runs entries sequentially before debugger starts
+- supports both task and pipeline templates
+- aborts debug launch if prelaunch task fails/times out
+- auto-cleans active prelaunch runs on DAP terminate/exit/disconnect
+- manual fallback: `:FlyoutStopPrelaunch`
+
+## Flyout vs overseer.nvim
+
+`overseer.nvim` is a great, mature task system with broad extensibility.
+Flyout is currently optimized for a narrower workflow: quick task loops + DAP prelaunch + clean project-local templates.
+
+Why people may prefer Flyout:
+
+- Simpler mental model: task templates and pipelines are just `.flyout/templates.lua`
+- Pipeline-first task list UX (`za`, pipeline-aware `s`/`r`/`dd`)
+- Fast template flow from UI (`A`, `a`, `C`, `E`, `:FlyoutPick`)
+- Tight `nvim-dap` preLaunchTask bridge with sequential lists and cleanup hooks
+- Lightweight setup and straightforward defaults for solo projects
+
+If you need deep integration points and a larger plugin ecosystem, Overseer may be a better fit.
+If you want a focused runner/debug prelaunch workflow with minimal ceremony, Flyout is usually the better fit.
+
+## Configuration
 
 ```lua
 require("flyout").setup({
@@ -43,105 +192,49 @@ require("flyout").setup({
         ready_timeout_ms = 0,
     },
     ui = {
-        -- enable/disable preview window in :FlyoutTasks
         preview_enabled = true,
-
-        -- task list width in columns or percent string
-        -- examples: 56, "35%"
-        -- default is "50%"
-        task_list_width = "50%",
-
-        -- task list height in rows or percent string
-        -- examples: 12, "25%"
-        -- default is "25%"
-        task_list_height = "25%",
-
-        -- preview height in rows or percent string
-        -- examples: 14, "40%"
-        -- default is "40%"
-        preview_height = "40%",
-
-        -- terminal scrollback for terminal log view
-        -- default is 200000
-        -- use -1 for a very large value
+        task_list_width = "50%",   -- number or percent string
+        task_list_height = "25%",  -- number or percent string
+        preview_height = "40%",    -- number or percent string
         log_terminal_scrollback = 200000,
     },
     quickfix = {
-        -- auto-generate parser commands like :Fgcc, :Fmsvc, :Frust
         generate_commands = true,
-
-        -- prefix for generated commands (for example "F" => :Fgcc)
         command_prefix = "F",
-
-        -- optional: add or override parser definitions
+        command_completion = "auto", -- auto | shellcmd | file | none
         parsers = {
-            -- custom parser
-            -- mylang = { efm = "%E%f:%l:%c: %m" },
-
-            -- override built-in parser
-            -- gcc = { efm = "%f:%l:%c: %m" },
+            -- mylang = { efm = "%f:%l:%c: %m" },
         },
     },
-    notifications = {
+    notify = {
+        notify_backend = "auto", -- auto | vim | fy | flyout | snacks | nvim-notify | mini.notify
+        override_vim_notify = false,
         start = true,
         ["end"] = true,
         progress = {
             enabled = false,
             interval_ms = 120,
-            frames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" },
+            -- frames = { ... },
         },
     },
 })
 ```
 
-### Quickfix Parsers
+Built-in quickfix parser names:
 
-- Built-in parser names: `gcc`, `msvc`, `rust`, `go`, `py`, `pyt`, `tsc`, `js`, `java`, `lua`
-- Generated commands use parser names with your prefix:
-  `:Fgcc`, `:Fmsvc`, `:Frust`, `:Fgo`, `:Fpy`, `:Fpyt`, `:Ftsc`, `:Fjs`, `:Fjava`, `:Flua`
-- You can extend or override parser definitions with `quickfix.parsers`
+- `gcc`, `msvc`, `rust`, `go`, `py`, `pyt`, `tsc`, `js`, `java`, `lua`
 
-### Notifications
+## API (Common)
 
-- Notification toggles are independent: `start`, `progress.enabled`, `end`
-- To show progress only, set: `start = false`, `progress.enabled = true`, `end = false`
-- Progress stops automatically on task `ready` (if `ready_when` is set) or task exit
-- Progress spinner uses `vim.notify` and reuses your active notifier UI style
-
-### API Run Options
-
-- `require("flyout").start(cmd, opts)` supports:
-  - `timeout_ms`
-  - `ready_when = "plain text"` or `{ pattern, match = "plain"|"regex", count, timeout_ms }`
-  - `notify = { start, ["end"], progress = true|{ enabled, interval_ms, frames } }`
-
-### Width Rules
-
-- `task_list_width` accepts either:
-  - integer columns (for example `56`)
-  - percent string (for example `"35%"`)
-- task-list width is clamped to a minimum required width for fields
-- task list and preview are always shown in a top-bottom layout
-- preview width follows task-list width
-
-### Height Rules
-
-- `task_list_height` accepts:
-  - integer rows (for example `18`)
-  - percent string (for example `"40%"`)
-- `preview_height` accepts:
-  - integer rows (for example `14`)
-  - percent string (for example `"40%"`)
-- if list + preview cannot fit in the current screen, preview is hidden automatically
-
-### Log View
-
-- Full log windows (float/split/vsplit/tab) use terminal tailing (`tail -f`) for better large-log performance
-- Task preview in `:FlyoutTasks` also uses terminal tailing
-- `ui.log_terminal_scrollback` controls terminal log scrollback size
+- `require("flyout").start(cmd, opts)`
+- `require("flyout").stop(task_id)`
+- `require("flyout").rerun(task_id)`
+- `require("flyout").run_template(name)`
+- `require("flyout").pick_template()`
+- `require("flyout").enable_dap()`
+- `require("flyout").stop_active_prelaunch_tasks({ notify = true|false })`
 
 ## Notes
 
-- Flyout runs commands as non-interactive background tasks.
-- TTY-interactive programs are not supported in Flyout mode.
-- On `VimLeavePre`, Flyout sends `SIGTERM` to active tasks, then `SIGKILL` after a short grace period.
+- Commands run as background, non-interactive processes.
+- On `VimLeavePre`, Flyout requests task stop and then force-kills after a short grace period.
