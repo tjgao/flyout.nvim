@@ -100,6 +100,12 @@ end, {
     nargs = 1,
 })
 
+vim.api.nvim_create_user_command("FlyoutStopPrelaunch", function()
+    flyout.stop_active_prelaunch_tasks()
+end, {
+    nargs = 0,
+})
+
 vim.api.nvim_create_user_command("FlyoutPick", function()
     flyout.pick_template()
 end, {

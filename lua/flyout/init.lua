@@ -31,6 +31,12 @@ local pipeline_runs = {}
 local next_pipeline_run_id = 1
 local pipeline_task_to_run = {}
 local start_pipeline_step
+local clear_pipeline_run
+local dap_integration = {
+    enabled = false,
+    running_prelaunch = false,
+    active_starts = {},
+}
 
 local function is_progress_active_status(status)
     return status == "pending" or status == "running"
@@ -227,7 +233,29 @@ local function stop_pipeline_run(run_id)
     end
 end
 
-local function clear_pipeline_run(run_id)
+local function stop_active_prelaunch_tasks()
+    dap_integration.running_prelaunch = false
+    local starts = dap_integration.active_starts
+    dap_integration.active_starts = {}
+    local stopped_count = 0
+    for _, started in ipairs(starts) do
+        if started and started.type == "pipeline" and tonumber(started.id) then
+            local run_id = tonumber(started.id)
+            stopped_count = stopped_count + 1
+            stop_pipeline_run(run_id)
+            clear_pipeline_run(run_id)
+        else
+            local id = tonumber(started and started.id)
+            if id then
+                stopped_count = stopped_count + 1
+                pcall(M.stop, id)
+            end
+        end
+    end
+    return stopped_count
+end
+
+clear_pipeline_run = function(run_id)
     local state = pipeline_runs[run_id]
     if not state then
         return
@@ -681,6 +709,9 @@ function M.run_template(name)
     if not list then
         return nil, by_name
     end
+    if type(by_name) ~= "table" then
+        return nil, "failed to resolve templates"
+    end
     local template = by_name[name]
     if not template then
         return nil, string.format("template '%s' not found", name)
@@ -695,6 +726,249 @@ function M.run_template(name)
     end
 
     return start_task_template(template)
+end
+
+local function prelaunch_task_names(config)
+    if type(config) ~= "table" then
+        return {}
+    end
+
+    local value = config.preLaunchTask
+    local out = {}
+    if type(value) == "string" and value ~= "" then
+        out[#out + 1] = value
+    elseif type(value) == "table" then
+        for _, item in ipairs(value) do
+            if type(item) == "string" and item ~= "" then
+                out[#out + 1] = item
+            end
+        end
+    end
+    return out
+end
+
+local function off_listener(event, id)
+    if id then
+        pcall(task.off, event, id)
+    end
+end
+
+local function wait_for_task_or_pipeline(started, cb)
+    local task_id = tonumber(started and started.id)
+    local pipeline_run_id = nil
+    if started and started.type == "pipeline" then
+        pipeline_run_id = tonumber(started.id)
+        task_id = tonumber(started.first_task_id)
+    end
+    if not task_id then
+        cb(false, "invalid started task id")
+        return
+    end
+
+    local done = false
+    local ready_listener = nil
+    local exit_listener = nil
+    local timeout_listener = nil
+
+    local function cleanup()
+        off_listener("ready", ready_listener)
+        off_listener("exit", exit_listener)
+        off_listener("timeout", timeout_listener)
+    end
+
+    local function finish(ok, err)
+        if done then
+            return
+        end
+        done = true
+        cleanup()
+        cb(ok, err)
+    end
+
+    local function matches(payload)
+        local info = payload and payload.task
+        if not info then
+            return false
+        end
+        if pipeline_run_id then
+            return info.meta and info.meta.pipeline_run_id == pipeline_run_id
+        end
+        return tonumber(info.id) == task_id
+    end
+
+    local function is_pipeline_last_step(info)
+        local meta = info and info.meta
+        if not meta then
+            return false
+        end
+        local step = tonumber(meta.pipeline_step)
+        local total = tonumber(meta.pipeline_total_steps)
+        return step and total and step == total
+    end
+
+    ready_listener = task.on("ready", function(payload)
+        if not matches(payload) then
+            return
+        end
+        local info = payload.task
+        if pipeline_run_id then
+            if is_pipeline_last_step(info) then
+                finish(true)
+            end
+            return
+        end
+        finish(true)
+    end)
+
+    exit_listener = task.on("exit", function(payload)
+        if not matches(payload) then
+            return
+        end
+        local info = payload.task
+        if pipeline_run_id then
+            if not is_pipeline_last_step(info) then
+                return
+            end
+            if info.status == "success" then
+                finish(true)
+            else
+                finish(false, string.format("preLaunchTask '%s' failed", info.meta and info.meta.pipeline_name or "pipeline"))
+            end
+            return
+        end
+
+        if info.status == "success" then
+            finish(true)
+        else
+            finish(false, string.format("preLaunchTask '%s' failed", info.meta and info.meta.template_name or tostring(info.id)))
+        end
+    end)
+
+    timeout_listener = task.on("timeout", function(payload)
+        if payload and payload.kind == "ready" and matches(payload) then
+            local info = payload.task
+            finish(false, string.format("preLaunchTask '%s' ready timeout", info.meta and info.meta.template_name or tostring(info.id)))
+        elseif payload and payload.kind == "task" and matches(payload) then
+            local info = payload.task
+            finish(false, string.format("preLaunchTask '%s' timed out", info.meta and info.meta.template_name or tostring(info.id)))
+        end
+    end)
+
+    local current = task.get(task_id)
+    if current then
+        if pipeline_run_id then
+            if current.meta and current.meta.pipeline_run_id == pipeline_run_id and is_pipeline_last_step(current) and current.status == "success" then
+                finish(true)
+            end
+        else
+            if current.ready or current.status == "success" then
+                finish(true)
+            elseif current.status == "failed" or current.status == "timeout" or current.status == "stopped" or current.status == "killed" then
+                finish(false, string.format("preLaunchTask '%s' failed", current.meta and current.meta.template_name or tostring(current.id)))
+            end
+        end
+    end
+end
+
+function M.enable_dap(opts)
+    opts = opts or {}
+    if dap_integration.enabled then
+        return true
+    end
+
+    local ok, dap = pcall(require, "dap")
+    if not ok then
+        return nil, "nvim-dap is not available"
+    end
+
+    local original_run = dap.run
+    dap.listeners.before.event_terminated.flyout_prelaunch_cleanup = stop_active_prelaunch_tasks
+    dap.listeners.before.event_exited.flyout_prelaunch_cleanup = stop_active_prelaunch_tasks
+    dap.listeners.before.disconnect.flyout_prelaunch_cleanup = stop_active_prelaunch_tasks
+
+    dap.run = function(config, ...)
+        local prelaunch = prelaunch_task_names(config)
+        if #prelaunch == 0 then
+            return original_run(config, ...)
+        end
+        if dap_integration.running_prelaunch then
+            notifier.notify("Flyout: preLaunchTask is already running", vim.log.levels.WARN)
+            return
+        end
+
+        local list, list_err = M.list_templates()
+        if not list then
+            notifier.notify("Flyout: " .. tostring(list_err), vim.log.levels.ERROR)
+            return
+        end
+        local by_name = {}
+        for _, item in ipairs(list) do
+            by_name[item.name] = item
+        end
+        for _, name in ipairs(prelaunch) do
+            if not by_name[name] then
+                notifier.notify(string.format("Flyout: preLaunchTask '%s' not found", name), vim.log.levels.ERROR)
+                return
+            end
+        end
+
+        dap_integration.running_prelaunch = true
+        dap_integration.active_starts = {}
+        local run_args = { ... }
+
+        local function launch_at(index)
+            if index > #prelaunch then
+                dap_integration.running_prelaunch = false
+                local ok_run, run_err = pcall(function()
+                    original_run(config, table.unpack(run_args))
+                end)
+                if not ok_run then
+                    notifier.notify("Flyout: failed to start debugger: " .. tostring(run_err), vim.log.levels.ERROR)
+                end
+                return
+            end
+
+            local name = prelaunch[index]
+            local started, start_err = M.run_template(name)
+            if not started then
+                dap_integration.running_prelaunch = false
+                notifier.notify("Flyout: " .. tostring(start_err), vim.log.levels.ERROR)
+                stop_active_prelaunch_tasks()
+                return
+            end
+
+            dap_integration.active_starts[#dap_integration.active_starts + 1] = started
+
+            wait_for_task_or_pipeline(started, function(ok_ready, ready_err)
+                if not ok_ready then
+                    dap_integration.running_prelaunch = false
+                    notifier.notify("Flyout: " .. tostring(ready_err), vim.log.levels.ERROR)
+                    stop_active_prelaunch_tasks()
+                    return
+                end
+                launch_at(index + 1)
+            end)
+        end
+
+        notifier.notify(string.format("Flyout: running preLaunchTask(s): %s", table.concat(prelaunch, ", ")))
+        launch_at(1)
+    end
+
+    dap_integration.enabled = true
+    return true
+end
+
+function M.stop_active_prelaunch_tasks(opts)
+    opts = opts or {}
+    local stopped_count = stop_active_prelaunch_tasks()
+    if opts.notify ~= false then
+        if stopped_count > 0 then
+            notifier.notify(string.format("Flyout: stopped %d active preLaunchTask run(s)", stopped_count))
+        else
+            notifier.notify("Flyout: no active preLaunchTask runs", vim.log.levels.WARN)
+        end
+    end
+    return stopped_count
 end
 
 function M.pick_template()
